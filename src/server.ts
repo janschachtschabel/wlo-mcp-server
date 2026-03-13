@@ -418,39 +418,91 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
     },
   );
 
-  // ── Tool 5: fetch_web_content ────────────────────────────────────────────
+  // ── Helper for web tools ─────────────────────────────────────────────────
+  const makeWebTool = (base: string) => async (params: { path?: string; maxLength?: number }) => {
+    try {
+      const url = base + (params.path ?? '');
+      const raw = await fetchWebContent(url);
+      const limit = params.maxLength ?? 8000;
+      const trimmed = raw.length > limit
+        ? raw.slice(0, limit) + `\n\n[…abgeschnitten. Unterseite wählen oder maxLength erhöhen.]`
+        : raw;
+      return { content: [{ type: 'text' as const, text: trimmed || 'Kein Inhalt extrahiert.' }] };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: 'text' as const, text: `Fehler: ${msg}` }], isError: true };
+    }
+  };
+  const webParams = {
+    path: z.string().optional().describe(
+      'Optional subpage path, e.g. "/fachportale/informatik". Leave empty for the main page.'
+    ),
+    maxLength: z.number().int().min(500).max(20000).optional().default(8000).describe(
+      'Maximum characters to return (default 8000)'
+    ),
+  };
+
+  const webNav = `
+Multi-level exploration strategy (up to 5 levels):
+1. Call this tool without a path to fetch the main page and discover navigation links.
+2. Identify the ONE most relevant link for the user's question.
+3. Call this tool again with that path to get the subpage content.
+4. Repeat steps 2–3 up to 5 levels total until you have enough information to answer.
+Only follow ONE link per level – do not fetch multiple pages at the same depth.`;
+
+  // ── Tool 5a: get_wirlernenonline_info ────────────────────────────────────
   server.tool(
-    'fetch_web_content',
-    `Fetch and extract the text content of a project website page as Markdown.
-Only pages from the following whitelisted domains are allowed:
-- https://www.wirlernenonline.de  (WLO project website)
-- https://edu-sharing-network.org  (edu-sharing Network)
-- https://edu-sharing.com  (edu-sharing platform)
-- https://metaventis.com  (Metaventis)
-Subpages of these domains are also allowed.
-Tip: Fetch the main page first to discover menu/navigation links, then fetch relevant subpages.`,
-    {
-      url: z.string().url().describe(
-        'Full URL of the page to fetch, e.g. "https://www.wirlernenonline.de/ueber-uns/". ' +
-        `Allowed domains: ${WEB_CONTENT_WHITELIST.join(', ')}`
-      ),
-      maxLength: z.number().int().min(500).max(20000).optional().default(8000).describe(
-        'Maximum number of characters to return from the extracted Markdown (default 8000)'
-      ),
-    },
-    async (params) => {
-      try {
-        const raw = await fetchWebContent(params.url);
-        const limit = params.maxLength ?? 8000;
-        const trimmed = raw.length > limit
-          ? raw.slice(0, limit) + `\n\n[…Inhalt bei ${limit} Zeichen abgeschnitten. Rufe die Seite erneut mit größerem maxLength auf oder wähle eine spezifischere Unterseite.]`
-          : raw;
-        return { content: [{ type: 'text', text: trimmed || 'Kein Inhalt extrahiert.' }] };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: 'text', text: `Fehler beim Abrufen der Webseite: ${msg}` }], isError: true };
-      }
-    },
+    'get_wirlernenonline_info',
+    `Fetch information from WirLernenOnline (WLO) – the German OER portal website.
+Use this tool when the user asks about: WirLernenOnline, WLO, OER, OER-Statistik, Fachportale,
+Qualitätssicherung, Quellenerschließung, WLO Plug-ins, Mitmachen, Fachredaktion,
+or portal/subject names like Informatik, Deutsch, Medienbildung, Zeitgemäße Bildung,
+Nachhaltigkeit, ComeIn.
+Base URL: https://www.wirlernenonline.de
+${webNav}`,
+    webParams,
+    makeWebTool('https://www.wirlernenonline.de'),
+  );
+
+  // ── Tool 5b: get_edu_sharing_network_info ────────────────────────────────
+  server.tool(
+    'get_edu_sharing_network_info',
+    `Fetch information from edu-sharing-network.org – the edu-sharing community and network site.
+Use this tool when the user asks about: edu-sharing Vernetzung, Bildungscloud, offene Bildung,
+Community, open source, E-Learning, or project/event names like ITsJOINTLY, JOINTLY, BIRD,
+Bildungsraum Digital, OER-Statistik, OER- & IT-Sommercamp, Hackathon,
+Hackathons für OER-Softwarelösungen, WirLernenOnline (Projektkontext).
+Base URL: https://edu-sharing-network.org
+${webNav}`,
+    webParams,
+    makeWebTool('https://edu-sharing-network.org'),
+  );
+
+  // ── Tool 5c: get_edu_sharing_product_info ───────────────────────────────
+  server.tool(
+    'get_edu_sharing_product_info',
+    `Fetch information from edu-sharing.com – the edu-sharing software product website.
+Use this tool when the user asks about: edu-sharing, Open Source, Bildungscloud,
+Enterprise Suchmaschine, Suchmaschine, E-Learning Cloudspeicher, Repository,
+Portal für Bildungsmedien, Cloudspeicher, Tools & Plugins, Architektur & Integration,
+Dokumentation, Downloads, Moodle Integration, App, Demo.
+Base URL: https://edu-sharing.com
+${webNav}`,
+    webParams,
+    makeWebTool('https://edu-sharing.com'),
+  );
+
+  // ── Tool 5d: get_metaventis_info ─────────────────────────────────────────
+  server.tool(
+    'get_metaventis_info',
+    `Fetch information from metaventis.com – the metaVentis company website (edu-sharing core dev team).
+Use this tool when the user asks about: metaVentis, edu-sharing Kern-Entwicklerteam,
+Landes-Schulcloud, OER auf Landesebene, IDM Landeskonzepte, Autoren- & Redaktions-Lösung,
+IT-Partner für F&E-Projekte, Firmenwissen und E-Learning integriert.
+Base URL: https://metaventis.com
+${webNav}`,
+    webParams,
+    makeWebTool('https://metaventis.com'),
   );
 
   // ── Tool 6: lookup_wlo_vocabulary ─────────────────────────────────────────
