@@ -262,6 +262,9 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
       maxResults: z.number().int().min(1).max(100).optional().default(20).describe(
         'Maximum number of items to return (1–100, default 20)'
       ),
+      skipCount: z.number().int().min(0).optional().default(0).describe(
+        'Number of items to skip for pagination (default 0)'
+      ),
       environment: z.enum(['production', 'staging']).optional().describe(
         'WLO environment: "production" (default) or "staging"'
       ),
@@ -270,6 +273,7 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
       const env: WloEnvironment = params.environment ?? defaultEnv;
       const filter = (params.contentFilter ?? 'files') as 'files' | 'folders' | 'both';
       const maxResults = params.maxResults ?? 20;
+      const skipCount = params.skipCount ?? 0;
 
       try {
         let allNodes: ReturnType<typeof formatNodes>[0][] = [];
@@ -301,7 +305,7 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
           }
           allNodes = allNodes.slice(0, maxResults);
         } else {
-          const response = await getCollectionContents(env, params.nodeId, filter, maxResults);
+          const response = await getCollectionContents(env, params.nodeId, filter, maxResults, skipCount);
           totalHits = response.pagination.total;
           let nodes = response.nodes;
           if (params.query?.trim() && filter !== 'folders') {

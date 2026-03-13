@@ -18,6 +18,7 @@ export interface FormattedNode {
   previewUrl: string;
   license: string;
   publisher: string;
+  nodeType: 'collection' | 'content';
 }
 
 function first(arr: string[] | undefined): string {
@@ -42,9 +43,10 @@ export function formatNode(node: WloNode): FormattedNode {
     userRoles:            resolveLabels(p['ccm:oeh_intended_end_user_role'], 'userRole'),
     learningResourceTypes:resolveLabels(p['ccm:oeh_lrt_aggregated'], 'lrt'),
     url:                  first(p['ccm:wwwurl']) || node.content?.url || '',
-    previewUrl:           (!node.preview?.isIcon ? node.preview?.url : '') ?? '',
+    previewUrl:           node.preview?.url ?? '',
     license:              first(p['ccm:commonlicense_key']) || '',
     publisher:            first(p['ccm:oeh_publisher_combined']) || '',
+    nodeType:             node.isDirectory === true ? 'collection' : 'content',
   };
 }
 
@@ -72,6 +74,7 @@ export function renderToText(nodes: FormattedNode[], totalHits?: number): string
     if (n.previewUrl)                  parts.push(`Vorschaubild: ${n.previewUrl}`);
     if (n.license)                     parts.push(`Lizenz: ${n.license}`);
     if (n.publisher)                   parts.push(`Anbieter: ${n.publisher}`);
+    parts.push(`Typ: ${n.nodeType === 'collection' ? 'Sammlung' : 'Inhalt'}`);
     lines.push(parts.join('\n'));
     lines.push('');
   }

@@ -25,6 +25,7 @@ export interface WloNode {
   ref?: { id: string; repo: string };
   name?: string;
   title?: string;
+  isDirectory?: boolean;
   properties?: Record<string, string[]>;
   preview?: { url?: string; isIcon?: boolean };
   content?: { url?: string };
