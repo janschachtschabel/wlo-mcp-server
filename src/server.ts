@@ -116,18 +116,46 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         // Level-1: filter direct children by keyword
         let matches = level1.filter(n => matchesQuery(n, query));
 
+        // Level-2 fallback: go one level deeper across all level-1 children
+        const level2Results = await Promise.allSettled(
+          level1.map(parent => getChildCollections(env, parent.ref?.id ?? '', 50))
+        );
+        const allLevel2Nodes: import('./wlo-api.js').WloNode[] = [];
+        for (const r of level2Results) {
+          if (r.status === 'fulfilled') {
+            allLevel2Nodes.push(...r.value);
+            matches.push(...r.value.filter(n => matchesQuery(n, query)));
+          }
+        }
+
         if (matches.length === 0) {
-          // Level-2 fallback: go one level deeper across all level-1 children
-          const level2 = await Promise.allSettled(
-            level1.map(parent => getChildCollections(env, parent.ref?.id ?? '', 50))
+          // Level-3 fallback: sort Level-2 nodes by query-word relevance,
+          // then fetch children of the top 15 most relevant Level-2 nodes
+          const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+          const scoreNode = (n: import('./wlo-api.js').WloNode): number => {
+            const text = [
+              n.properties?.['cm:name']?.[0] ?? '',
+              n.properties?.['cclom:title']?.[0] ?? '',
+              n.properties?.['cclom:general_description']?.[0] ?? '',
+            ].join(' ').toLowerCase();
+            return queryWords.reduce((s, w) => s + (text.includes(w) ? 1 : 0), 0);
+          };
+          // If any nodes score > 0, put them first; otherwise keep natural tree order
+          const anyScored = allLevel2Nodes.some(n => scoreNode(n) > 0);
+          const level2Candidates = anyScored
+            ? [...allLevel2Nodes].sort((a, b) => scoreNode(b) - scoreNode(a)).slice(0, 30)
+            : allLevel2Nodes.slice(0, 30);
+
+          const level3Results = await Promise.allSettled(
+            level2Candidates.map(parent => getChildCollections(env, parent.ref?.id ?? '', 30))
           );
-          for (const r of level2) {
+          for (const r of level3Results) {
             if (r.status === 'fulfilled') matches.push(...r.value.filter(n => matchesQuery(n, query)));
           }
         }
 
         if (matches.length === 0) {
-          return { content: [{ type: 'text', text: `Keine Sammlungen gefunden für "${query}". Ohne Suchbegriff alle Sammlungen unter diesem Knoten anzeigen.` }] };
+          return { content: [{ type: 'text', text: `Keine Sammlungen gefunden für "${query}". Versuche einen übergeordneten Begriff (z.B. "Mathematik" statt "Bruchrechnung") oder frag nach verfügbaren Sammlungen ohne Suchbegriff.` }] };
         }
 
         const formatted = formatNodes(matches.slice(0, maxResults));

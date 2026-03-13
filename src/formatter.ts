@@ -69,6 +69,7 @@ export function renderToText(nodes: FormattedNode[], totalHits?: number): string
     if (n.userRoles.length)            parts.push(`Zielgruppe: ${n.userRoles.join(', ')}`);
     if (n.learningResourceTypes.length)parts.push(`Ressourcentyp: ${n.learningResourceTypes.join(', ')}`);
     if (n.url)                         parts.push(`URL: ${n.url}`);
+    if (n.previewUrl)                  parts.push(`Vorschaubild: ${n.previewUrl}`);
     if (n.license)                     parts.push(`Lizenz: ${n.license}`);
     if (n.publisher)                   parts.push(`Anbieter: ${n.publisher}`);
     lines.push(parts.join('\n'));
