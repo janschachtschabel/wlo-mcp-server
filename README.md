@@ -73,14 +73,19 @@ npm run dev:http     # HTTP
 
 | # | Tool | Beschreibung |
 |---|---|---|
-| 1 | `search_wlo_collections` | Sammlungen (= Themenseiten) suchen und durchsuchen |
-| 2 | `search_wlo_content` | Globale Volltextsuche nach Bildungsinhalten (Dateien/Materialien) |
-| 3 | `get_collection_contents` | Inhalte oder Untersammlungen einer Sammlung abrufen (via nodeId) |
+| 1 | `search_wlo_collections` | Sammlungen (= Themenseiten) suchen – primär via Volltext-API, Fallback via Baum-Traversierung |
+| 2 | `search_wlo_content` | Globale Volltextsuche nach Bildungsinhalten (Dateien, Videos, Arbeitsblätter) |
+| 3 | `get_collection_contents` | Inhalte oder Untersammlungen einer Sammlung abrufen – mit Pagination via `skipCount` |
 | 4 | `get_node_details` | Detailmetadaten, Volltext und Eltern-Sammlungen für eine Node-ID |
-| 5 | `fetch_web_content` | Textinhalt einer Projektwebseite als Markdown extrahieren |
+| 5a | `get_wirlernenonline_info` | Infos von der WirLernenOnline-Projektwebseite (mehrstufiges Crawling) |
+| 5b | `get_edu_sharing_network_info` | Infos von edu-sharing-network.org (Community, Projekte, Events) |
+| 5c | `get_edu_sharing_product_info` | Infos von edu-sharing.com (Produkt, Dokumentation, Features) |
+| 5d | `get_metaventis_info` | Infos von metaventis.com (Unternehmen, Dienstleistungen) |
 | 6 | `lookup_wlo_vocabulary` | Gültige Filterwerte für Bildungsstufe, Fach, Zielgruppe, Ressourcentyp |
 
 > **Konzept:** In WLO sind **Sammlungen** und **Themenseiten** dasselbe. Eine Sammlung wird im WLO-Repository als Themenseite angezeigt und bündelt Bildungsinhalte in **Schwimmlinien (Swimlanes/Karussells)**. Untersammlungen entsprechen Unter-Themenseiten.
+
+> **Tool-Routing:** Das LLM sollte `search_wlo_content` (nicht `search_wlo_collections`) nutzen, wenn nach konkreten Inhaltstypen gefragt wird (Videos, Arbeitsblätter, PDFs). Die Web-Tools (`get_*_info`) sollten genutzt werden, wenn nach den Projekten/Plattformen selbst gefragt wird – nicht nach Lernmaterialien.
 
 ---
 
@@ -105,20 +110,20 @@ Sucht thematische Sammlungen (Themenseiten) im WLO-Repository.
 **Verwendete API-Endpunkte:**
 
 ```
+# Primär: Volltext-Sammlungssuche (gibt isDirectory=true Nodes zurück)
+POST /search/v1/queries/-home-/mds_oeh/collections?contentType=COLLECTIONS&maxItems={n}
+
+Body: { "criteria": [ { "property": "ngsearchword", "values": ["..."] } ] }
+
+# Fallback: Kinder-Traversierung (wenn parentNodeId gegeben oder Direktsuche leer)
 GET /node/v1/nodes/-home-/{nodeId}/children?filter=folders&maxItems=100&propertyFilter=-all-
 ```
 
-- `nodeId` ist bei leerem `parentNodeId` die WLO-Root-Collection-ID (`5e40e372-735c-4b17-bbf7-e827a5702b57`), andernfalls die übergebene `parentNodeId`.
-- Der Parameter `filter=folders` liefert ausschließlich Verzeichnis-Nodes (Sammlungen), keine Inhalts-Dateien.
+**Suchstrategie:**
 
-**Nachbereitung (Browse-then-Filter):**
-
-> **Hinweis:** Der `ngsearch`-Endpunkt liefert für anonyme Nutzer keine echten Collection-Nodes, unabhängig von `contentType=COLLECTIONS` oder `filter=collections`. Die einzig funktionierende Methode für anonymen Zugriff auf Sammlungen ist die Kinder-Traversierung über `/children?filter=folders`.
-
-1. **Level 1:** Direkte Kinder der Startnode werden abgerufen (max. 100).
-2. **Keyword-Filter:** Treffer werden über Volltextvergleich gegen `cm:name`, `cclom:title` und `cclom:general_description` ermittelt.
-3. **Level 2 Fallback:** Falls auf Level 1 keine Treffer → alle Level-1-Kinder werden parallel abgefragt und deren Kinder gefiltert.
-4. **Formatierung:** Jede Sammlung wird mit nodeId, Titel, Fach, Bildungsstufe, Schlagworten und WLO-URL ausgegeben.
+1. **Direktsuche (primär):** Bei gesetztem `query` ohne `parentNodeId` → Volltext-API mit `contentType=COLLECTIONS`. Liefert echte Collection-Nodes (`isDirectory=true`). Eigenschaften wie Titel und Beschreibung sind direkt am Node (`node.collection.description`).
+2. **Baum-Traversierung (Fallback):** Bei `parentNodeId` oder leerem Ergebnis → Kinder-Traversierung ab der Startnode (WLO-Root oder gegebener Parent). Keyword-Matching auf `cm:name`, `cclom:title`, `cclom:general_description`. Suchbegriff wird in Einzelwörter zerlegt – Treffer bei jedem Wort.
+3. **Formatierung:** Jede Sammlung wird mit `nodeId`, Titel, Beschreibung, Fach, Bildungsstufe, Schlagworten, WLO-URL und `Typ: Sammlung` ausgegeben.
 
 ---
 
@@ -181,20 +186,23 @@ Ruft die Inhalte (Dateien/Untersammlungen) einer bekannten Sammlung ab.
 | `contentFilter` | enum | `"files"` | `"files"` = Lernmaterialien, `"folders"` = Unter-Sammlungen, `"both"` = alles |
 | `includeSubcollections` | bool | `false` | Wenn `true`: rekursiv alle Untersammlungen traversieren |
 | `maxResults` | int | `20` | Max. Ergebnisse (1–100) |
+| `skipCount` | int | `0` | Offset für Pagination (0 = erste Seite, 4 = zweite Seite bei maxResults=4) |
 | `environment` | enum | `production` | `"production"` oder `"staging"` |
 
 **Verwendete API-Endpunkte:**
 
 ```
 # Inhalte (Dateien)
-GET /node/v1/nodes/-home-/{nodeId}/children?filter=files&maxItems={n}&propertyFilter=-all-
+GET /node/v1/nodes/-home-/{nodeId}/children?filter=files&maxItems={n}&skipCount={s}&propertyFilter=-all-
 
 # Untersammlungen
-GET /node/v1/nodes/-home-/{nodeId}/children?filter=folders&maxItems={n}&propertyFilter=-all-
+GET /node/v1/nodes/-home-/{nodeId}/children?filter=folders&maxItems={n}&skipCount={s}&propertyFilter=-all-
 
 # Alles (kein Filter)
-GET /node/v1/nodes/-home-/{nodeId}/children?maxItems={n}&propertyFilter=-all-
+GET /node/v1/nodes/-home-/{nodeId}/children?maxItems={n}&skipCount={s}&propertyFilter=-all-
 ```
+
+**Pagination:** Die Antwort enthält `pagination.total`. Mit `skipCount` kann seitenweise durch Inhalte geblättert werden, z.B. `maxResults=4, skipCount=0` (1–4), `skipCount=4` (5–8) usw.
 
 **Nachbereitung:**
 
@@ -237,15 +245,22 @@ GET /node/v1/nodes/-home-/{nodeId}/parents?propertyFilter=-all-
 
 ---
 
-### 5. `fetch_web_content`
+### 5. Web-Informations-Tools (4 Tools)
 
-Extrahiert den Textinhalt einer Projektwebseite als Markdown.
+Die vier Web-Tools rufen Informationen von den Projektwebseiten ab. Jedes Tool ist einer Domain fest zugeordnet und wird vom LLM anhand der Themen-Keywords ausgewählt.
 
-**Parameter:**
+| Tool | Base URL | Trigger-Keywords |
+|---|---|---|
+| `get_wirlernenonline_info` | `https://www.wirlernenonline.de` | WLO, WirLernenOnline, OER, Fachportale, Qualitätssicherung, Mitmachen, Informatik, Deutsch, Medienbildung, ComeIn |
+| `get_edu_sharing_network_info` | `https://edu-sharing-network.org` | edu-sharing Vernetzung, JOINTLY, ITsJOINTLY, BIRD, Bildungsraum Digital, Hackathon, OER-Sommercamp |
+| `get_edu_sharing_product_info` | `https://edu-sharing.com` | edu-sharing Produkt, Repository, Suchmaschine, Moodle Integration, Cloudspeicher, Plugins, Dokumentation, Demo |
+| `get_metaventis_info` | `https://metaventis.com` | metaVentis, Schulcloud, IDM, Autoren-Lösung, F&E, Firmenwissen und E-Learning |
+
+**Parameter (alle 4 Tools identisch):**
 
 | Parameter | Typ | Standard | Beschreibung |
 |---|---|---|---|
-| `url` | string (URL) | **Pflicht** | Vollständige URL der Seite |
+| `path` | string | `""` | Unterseiten-Pfad, z.B. `"/fachportale/informatik"`. Leer = Hauptseite |
 | `maxLength` | int | `8000` | Max. Zeichen im Markdown-Output (500–20000) |
 
 **Verwendeter externer Dienst:**
@@ -253,38 +268,21 @@ Extrahiert den Textinhalt einer Projektwebseite als Markdown.
 ```
 POST https://text-extraction.staging.openeduhub.net/from-url
 
-Body:
-{
-  "url": "https://...",
-  "method": "browser",
-  "browser_location": null,
-  "lang": "auto",
-  "output_format": "markdown",
-  "preference": "none"
-}
+Body: { "url": "...", "method": "browser", "output_format": "markdown" }
 ```
 
-Der Dienst rendert die Seite mit einem Headless-Browser und extrahiert den Textinhalt als Markdown. Damit werden auch JavaScript-gerenderte Seiten korrekt erfasst.
+Der Dienst rendert die Seite mit einem Headless-Browser und extrahiert den Textinhalt als Markdown (JavaScript-gerenderte Seiten werden korrekt erfasst).
 
-**Whitelist – erlaubte Domains:**
+**Mehrstufiges Crawling (bis 5 Ebenen):**
 
-Aus Sicherheitsgründen darf der Tool-Aufruf nur URLs aus folgenden Domains abrufen. Unterseiten (beliebige Pfade) sind jeweils erlaubt:
+Jedes Tool unterstützt eine LLM-gesteuerte mehrstufige Exploration:
 
-| Domain | Beschreibung |
-|---|---|
-| `https://www.wirlernenonline.de` | WLO-Projektwebseite |
-| `https://edu-sharing-network.org` | edu-sharing Network e.V. |
-| `https://edu-sharing.com` | edu-sharing Plattform |
-| `https://metaventis.com` | Metaventis GmbH |
-
-Subdomains der gelisteten Domains sind ebenfalls erlaubt. Jede andere URL wird mit einer Fehlermeldung abgewiesen.
+1. Tool ohne `path` aufrufen → Hauptseite laden, Navigationslinks entdecken
+2. Den **einen** relevantesten Link identifizieren → Tool erneut mit `path: "/unterseite"` aufrufen
+3. Schritte 1–2 wiederholen bis max. **5 Ebenen** oder ausreichend Information vorhanden
+4. Nur **einen Link pro Ebene** folgen (keine parallelen Abrufe auf gleicher Tiefe)
 
 **Whitelist erweitern:** In `src/wlo-api.ts` → `WEB_CONTENT_WHITELIST` Array anpassen.
-
-**Nachbereitung:**
-
-- Der Markdown-Output wird auf `maxLength` Zeichen gekürzt. Ein Hinweis im Text signalisiert die Kürzung.
-- **Empfohlener Workflow:** Hauptseite zuerst abrufen → Navigationslinks im Markdown erkennen → relevante Unterseiten gezielt nachladen.
 
 ---
 
@@ -321,7 +319,7 @@ Alle verfügbaren Werte mit URIs: `lookup_wlo_vocabulary(vocabulary="discipline"
 
 ### Option A: Vercel (empfohlen für öffentliche API)
 
-> **Hinweis Vercel-Plan:** Das Tool `fetch_web_content` ruft einen externen Browser-Rendering-Dienst auf, der bis zu 20–30 Sekunden dauern kann. Das `vercel.json` setzt `maxDuration: 30`. Vercel **Hobby** erlaubt maximal 10 Sekunden – für `fetch_web_content` ist daher mindestens **Vercel Pro** erforderlich. Alle anderen Tools (Suche, Collections, Node-Details) laufen problemlos auf Hobby.
+> **Hinweis Vercel-Plan:** Die Web-Tools (`get_*_info`) rufen einen externen Browser-Rendering-Dienst auf, der bis zu 20–30 Sekunden dauern kann. Die `vercel.json` setzt `maxDuration: 30`. Vercel **Hobby** erlaubt maximal 10 Sekunden – für die Web-Tools ist daher mindestens **Vercel Pro** erforderlich. Alle anderen Tools (Suche, Collections, Node-Details, Vokabular) laufen problemlos auf Hobby.
 
 1. Repository auf GitHub pushen
 2. Vercel → **New Project** → Repository importieren
@@ -424,19 +422,35 @@ response = client.beta.messages.create(
 ```
 wlomcp/
 ├── src/
-│   ├── server.ts       # MCP Server + alle 6 Tool-Definitionen (transport-agnostisch)
+│   ├── server.ts       # MCP Server + alle 9 Tool-Definitionen (transport-agnostisch)
 │   ├── vocabs.ts       # Label ↔ URI Mappings (Bildungsstufe, Fach, Zielgruppe, LRT)
-│   ├── wlo-api.ts      # WLO/EduSharing API Client + Web Content Extraction
+│   ├── wlo-api.ts      # WLO/EduSharing API Client + Web Content Extraction + Whitelist
 │   ├── reranker.ts     # Multi-Query-Expansion + RRF + Relevance Scoring
-│   ├── formatter.ts    # WLO-Node → strukturierter Markdown-Output
+│   ├── formatter.ts    # WLO-Node → strukturierter Markdown-Output (mit Typ: Sammlung/Inhalt)
 │   ├── stdio.ts        # Entry: stdio Transport
 │   └── http.ts         # Entry: Streamable HTTP Transport
 ├── api/
 │   └── mcp.ts          # Vercel Serverless Function
-├── vercel.json         # Vercel Konfiguration
+├── vercel.json         # Vercel Konfiguration (maxDuration: 30s für Web-Tools)
 ├── Dockerfile          # Docker Build
 └── .env.example        # Umgebungsvariablen
 ```
+
+**Output-Format (`formatter.ts`):**
+
+Jeder Node wird als Markdown-Block ausgegeben:
+```
+## Titel
+nodeId: <uuid>
+Beschreibung: ...
+Fach: Mathematik
+Bildungsstufe: Sekundarstufe I
+URL: https://...
+Vorschaubild: https://...
+Typ: Sammlung   ← oder: Typ: Inhalt
+```
+
+`Typ: Sammlung` = Collection-Node (`isDirectory=true`), `Typ: Inhalt` = Datei/Material.
 
 **API-Basis-URLs:**
 
