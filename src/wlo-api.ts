@@ -28,6 +28,7 @@ export interface WloNode {
   properties?: Record<string, string[]>;
   preview?: { url?: string; isIcon?: boolean };
   content?: { url?: string };
+  collection?: { description?: string; title?: string; childCollectionsCount?: number };
 }
 
 export interface SearchResponse {
@@ -109,6 +110,29 @@ export async function ngsearchCollections(
     nodes: data.nodes ?? [],
     pagination: data.pagination ?? { total: 0, from: 0, count: 0 },
   };
+}
+
+/**
+ * POST /search/v1/queries/-home-/mds_oeh/collections?contentType=COLLECTIONS
+ * Full-text keyword search that returns real COLLECTION nodes (isDirectory=true).
+ * Unlike ngsearch with filter=collections, this endpoint correctly returns ccm:map nodes.
+ */
+export async function searchCollectionsByKeyword(
+  env: WloEnvironment,
+  query: string,
+  maxItems = 10,
+): Promise<WloNode[]> {
+  const params = new URLSearchParams({
+    contentType: 'COLLECTIONS',
+    maxItems: String(maxItems),
+    skipCount: '0',
+  });
+  const url = `${base(env)}/search/v1/queries/-home-/mds_oeh/collections?${params}`;
+  const body = JSON.stringify({ criteria: [{ property: 'ngsearchword', values: [query] }] });
+  const res = await fetch(url, { method: 'POST', headers: HEADERS, body });
+  if (!res.ok) return [];
+  const data = await res.json() as { nodes?: WloNode[] };
+  return data.nodes ?? [];
 }
 
 /**

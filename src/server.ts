@@ -7,7 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type { WloEnvironment, SearchCriterion } from './wlo-api.js';
-import { ngsearch, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, fetchWebContent, WEB_CONTENT_WHITELIST, WLO_ROOT_COLLECTION_IDS } from './wlo-api.js';
+import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, fetchWebContent, WEB_CONTENT_WHITELIST, WLO_ROOT_COLLECTION_IDS } from './wlo-api.js';
 import { enhancedSearch, rerankNodes } from './reranker.js';
 import { formatNodes, renderToText } from './formatter.js';
 import { resolveVocab, listVocab, type VocabKey } from './vocabs.js';
@@ -89,13 +89,15 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
       const env: WloEnvironment = params.environment ?? defaultEnv;
       const maxResults = params.maxResults ?? 5;
 
-      // Keyword match against collection name / title / description
+      // Keyword match: split query into words, match if ANY word hits name/title/desc
       const matchesQuery = (node: import('./wlo-api.js').WloNode, q: string): boolean => {
-        const lower = q.toLowerCase();
-        const name  = (node.properties?.['cm:name']?.[0] ?? node.name ?? '').toLowerCase();
-        const title = (node.properties?.['cclom:title']?.[0] ?? node.title ?? '').toLowerCase();
-        const desc  = (node.properties?.['cclom:general_description']?.[0] ?? '').toLowerCase();
-        return name.includes(lower) || title.includes(lower) || desc.includes(lower);
+        const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+        const haystack = [
+          node.properties?.['cm:name']?.[0] ?? node.name ?? '',
+          node.properties?.['cclom:title']?.[0] ?? node.title ?? '',
+          node.properties?.['cclom:general_description']?.[0] ?? '',
+        ].join(' ').toLowerCase();
+        return words.some(w => haystack.includes(w));
       };
 
       try {
@@ -103,8 +105,19 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         // Use parentNodeId if given, otherwise start from WLO root
         const startId  = params.parentNodeId ?? WLO_ROOT_COLLECTION_IDS[env];
 
-        // ngsearch with any filter= variant returns ccm:io FILE nodes, not real collection nodes.
-        // Node-children traversal is the only anonymous-access approach for real collections.
+        // ── Primary: full-text search via contentType=COLLECTIONS ─────────────
+        // Only use for root-level search (no parentNodeId) so guided traversal
+        // still works correctly when the client restricts to a subtree.
+        if (query && !params.parentNodeId) {
+          const directHits = await searchCollectionsByKeyword(env, query, maxResults);
+          if (directHits.length > 0) {
+            const formatted = formatNodes(directHits);
+            const text = renderToText(formatted, directHits.length);
+            return { content: [{ type: 'text', text }] };
+          }
+        }
+
+        // ── Fallback: children-traversal (used when parentNodeId given or direct search empty) ──
         const level1 = await getChildCollections(env, startId, 100);
 
         if (!query) {

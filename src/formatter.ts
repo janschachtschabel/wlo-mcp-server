@@ -35,7 +35,7 @@ export function formatNode(node: WloNode): FormattedNode {
   return {
     nodeId,
     title:                first(p['cclom:title']) || first(p['cm:name']) || node.name || node.title || '',
-    description:          first(p['cclom:general_description']) || '',
+    description:          first(p['cclom:general_description']) || node.collection?.description || '',
     keywords:             p['cclom:general_keyword'] ?? [],
     disciplines:          resolveLabels(p['ccm:taxonid'], 'discipline'),
     educationalContexts:  resolveLabels(p['ccm:educationalcontext'], 'educationalContext'),
