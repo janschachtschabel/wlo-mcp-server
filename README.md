@@ -82,10 +82,11 @@ npm run dev:http     # HTTP
 | 5c | `get_edu_sharing_product_info` | Infos von edu-sharing.com (Produkt, Dokumentation, Features) |
 | 5d | `get_metaventis_info` | Infos von metaventis.com (Unternehmen, Dienstleistungen) |
 | 6 | `lookup_wlo_vocabulary` | Gültige Filterwerte für Bildungsstufe, Fach, Zielgruppe, Ressourcentyp |
+| 7 | `search_wlo_topic_pages` | Themenseiten suchen – kuratierte Layouts mit Swimlanes, nach Zielgruppe filterbar |
 
-> **Konzept:** In WLO sind **Sammlungen** und **Themenseiten** dasselbe. Eine Sammlung wird im WLO-Repository als Themenseite angezeigt und bündelt Bildungsinhalte in **Schwimmlinien (Swimlanes/Karussells)**. Untersammlungen entsprechen Unter-Themenseiten.
+> **Konzept:** In WLO sind **Sammlungen** und **Themenseiten** dasselbe. Eine Sammlung wird im WLO-Repository als Themenseite angezeigt und bündelt Bildungsinhalte in **Schwimmlinien (Swimlanes/Karussells)**. Untersammlungen entsprechen Unter-Themenseiten. Sammlungen mit `ccm:page_config_ref` haben eine kuratierte **Themenseite** mit zielgruppenspezifischen Varianten (Lehrkräfte, Lernende, Allgemein).
 
-> **Tool-Routing:** Das LLM sollte `search_wlo_content` (nicht `search_wlo_collections`) nutzen, wenn nach konkreten Inhaltstypen gefragt wird (Videos, Arbeitsblätter, PDFs). Die Web-Tools (`get_*_info`) sollten genutzt werden, wenn nach den Projekten/Plattformen selbst gefragt wird – nicht nach Lernmaterialien.
+> **Tool-Routing:** Das LLM sollte `search_wlo_content` (nicht `search_wlo_collections`) nutzen, wenn nach konkreten Inhaltstypen gefragt wird (Videos, Arbeitsblätter, PDFs). `search_wlo_topic_pages` nutzen, wenn explizit nach Themenseiten, kuratierten Seiten oder zielgruppenspezifischen Ansichten gefragt wird. Die Web-Tools (`get_*_info`) sollten genutzt werden, wenn nach den Projekten/Plattformen selbst gefragt wird – nicht nach Lernmaterialien.
 
 ---
 
@@ -300,6 +301,62 @@ Listet alle gültigen Werte und URIs für die Filter-Parameter auf.
 
 ---
 
+### 7. `search_wlo_topic_pages`
+
+Sucht Themenseiten auf WirLernenOnline. Themenseiten sind kuratierte Layouts mit Swimlanes, zugeschnitten auf verschiedene Zielgruppen (Lehrkräfte, Lernende, Allgemein). Sie sind an Sammlungen gekoppelt über die Property `ccm:page_config_ref`.
+
+**Parameter:**
+
+| Parameter | Typ | Standard | Beschreibung |
+|---|---|---|---|
+| `query` | string | `""` | Thematische Suche, z.B. `"Physik"` oder `"Farben"`. Sucht Sammlungen und prüft ob Themenseite vorhanden. Leer = alle Themenseiten listen |
+| `targetGroup` | enum | – | Zielgruppe: `"teacher"` (Lehrkräfte), `"learner"` (Lernende), `"general"` (Allgemein) |
+| `educationalContext` | string | – | Bildungsstufe: `"Grundschule"`, `"Sekundarstufe I"` oder URI |
+| `collectionId` | string | – | Direkt-Check einer Sammlung auf Themenseite (NodeId). Umgeht die Suche – nützlich wenn bereits eine Sammlung aus `search_wlo_collections` vorliegt |
+| `maxResults` | int | `5` | Max. Ergebnisse (1–20) |
+| `environment` | enum | `production` | `"production"` oder `"staging"` |
+
+**Drei Suchmodi:**
+
+1. **Mode A – Direkt-Check** (`collectionId` gesetzt): Prüft die Sammlung auf `ccm:page_config_ref`, traversiert die Config-Kinder → Varianten.
+2. **Mode B – Thematische Suche** (`query` gesetzt): Sucht erst Sammlungen per Keyword, filtert auf `page_config_ref`, löst Varianten auf.
+3. **Mode C – Alle auflisten** (kein `query`, kein `collectionId`): Nutzt die `page_variant` API, optional gefiltert nach `targetGroup` und `educationalContext`.
+
+**Verwendete API-Endpunkte:**
+
+```
+# Mode B: Sammlung finden
+POST /search/v1/queries/-home-/mds_oeh/collections?contentType=COLLECTIONS&propertyFilter=-all-
+
+# Mode A+B: Config-Kinder traversieren
+GET /node/v1/nodes/-home-/{configId}/children?filter=folders&propertyFilter=-all-
+GET /node/v1/nodes/-home-/{configNodeId}/children?propertyFilter=-all-
+
+# Mode C: page_variant Suche
+POST /search/v1/queries/-home-/mds_oeh/page_variant?contentType=ALL&propertyFilter=-all-
+Body: { "criteria": [
+  { "property": "ccm:page_variant_is_template", "values": ["false"] },
+  { "property": "ccm:page_variant_profiling_target_group", "values": ["teacher"] }
+] }
+```
+
+**Output-Format:**
+
+```
+Gefundene Themenseiten: 2
+
+## Physik
+Sammlung-nodeId: 94f22c9b-...
+Variante-ID: abc123-...
+Zielgruppe: teacher
+Bildungsstufe: Sekundarstufe I, Sekundarstufe II
+Themenseite: https://redaktion.openeduhub.net/edu-sharing/components/topic-pages?collectionId=94f22c9b-...
+```
+
+**Hinweis Staging vs. Production:** Auf Production sind Themenseiten noch nicht vollständig ausgerollt (`ccm:page_config_ref` fehlt bei den meisten Sammlungen). Auf Staging sind die Varianten konfiguriert. Zum Testen `environment: "staging"` setzen.
+
+---
+
 ## Filter-Parameter
 
 Alle Filter akzeptieren **deutsche Labels** *oder* **vollständige URIs**. Die URI-Auflösung erfolgt lokal über `src/vocabs.ts`.
@@ -422,7 +479,7 @@ response = client.beta.messages.create(
 ```
 wlomcp/
 ├── src/
-│   ├── server.ts       # MCP Server + alle 9 Tool-Definitionen (transport-agnostisch)
+│   ├── server.ts       # MCP Server + alle 10 Tool-Definitionen (transport-agnostisch)
 │   ├── vocabs.ts       # Label ↔ URI Mappings (Bildungsstufe, Fach, Zielgruppe, LRT)
 │   ├── wlo-api.ts      # WLO/EduSharing API Client + Web Content Extraction + Whitelist
 │   ├── reranker.ts     # Multi-Query-Expansion + RRF + Relevance Scoring
@@ -447,10 +504,12 @@ Fach: Mathematik
 Bildungsstufe: Sekundarstufe I
 URL: https://...
 Vorschaubild: https://...
+Themenseite: https://...   ← nur wenn ccm:page_config_ref vorhanden
 Typ: Sammlung   ← oder: Typ: Inhalt
 ```
 
 `Typ: Sammlung` = Collection-Node (`isDirectory=true`), `Typ: Inhalt` = Datei/Material.
+`Themenseite:` = Kuratierte Themenseiten-URL, nur bei Sammlungen mit `ccm:page_config_ref`.
 
 **API-Basis-URLs:**
 

@@ -2,7 +2,8 @@
  * formatter.ts – Extract and clean WLO node properties into a structured output.
  */
 
-import type { WloNode } from './wlo-api.js';
+import type { WloNode, WloEnvironment } from './wlo-api.js';
+import { buildTopicPageUrl } from './wlo-api.js';
 import { labelFromUri } from './vocabs.js';
 
 export interface FormattedNode {
@@ -19,6 +20,7 @@ export interface FormattedNode {
   license: string;
   publisher: string;
   nodeType: 'collection' | 'content';
+  topicPageUrl: string;
 }
 
 function first(arr: string[] | undefined): string {
@@ -29,9 +31,13 @@ function resolveLabels(uris: string[] | undefined, vocab: Parameters<typeof labe
   return (uris ?? []).map(u => labelFromUri(u, vocab));
 }
 
+let _formatEnv: WloEnvironment = 'production';
+export function setFormatEnvironment(env: WloEnvironment): void { _formatEnv = env; }
+
 export function formatNode(node: WloNode): FormattedNode {
   const p = node.properties ?? {};
   const nodeId = node.ref?.id ?? first(p['sys:node-uuid']);
+  const pageConfigRef = first(p['ccm:page_config_ref']);
 
   return {
     nodeId,
@@ -47,6 +53,7 @@ export function formatNode(node: WloNode): FormattedNode {
     license:              first(p['ccm:commonlicense_key']) || '',
     publisher:            first(p['ccm:oeh_publisher_combined']) || '',
     nodeType:             node.isDirectory === true ? 'collection' : 'content',
+    topicPageUrl:         buildTopicPageUrl(_formatEnv, nodeId, pageConfigRef) ?? '',
   };
 }
 
@@ -74,6 +81,7 @@ export function renderToText(nodes: FormattedNode[], totalHits?: number): string
     if (n.previewUrl)                  parts.push(`Vorschaubild: ${n.previewUrl}`);
     if (n.license)                     parts.push(`Lizenz: ${n.license}`);
     if (n.publisher)                   parts.push(`Anbieter: ${n.publisher}`);
+    if (n.topicPageUrl)                parts.push(`Themenseite: ${n.topicPageUrl}`);
     parts.push(`Typ: ${n.nodeType === 'collection' ? 'Sammlung' : 'Inhalt'}`);
     lines.push(parts.join('\n'));
     lines.push('');

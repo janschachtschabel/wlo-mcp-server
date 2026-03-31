@@ -7,10 +7,11 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type { WloEnvironment, SearchCriterion } from './wlo-api.js';
-import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, fetchWebContent, WEB_CONTENT_WHITELIST, WLO_ROOT_COLLECTION_IDS } from './wlo-api.js';
+import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, fetchWebContent, WEB_CONTENT_WHITELIST, WLO_ROOT_COLLECTION_IDS, searchPageVariants, getCollectionThemePages, buildTopicPageUrl } from './wlo-api.js';
+import type { TargetGroup, ThemePageInfo } from './wlo-api.js';
 import { enhancedSearch, rerankNodes } from './reranker.js';
-import { formatNodes, renderToText } from './formatter.js';
-import { resolveVocab, listVocab, type VocabKey } from './vocabs.js';
+import { formatNodes, renderToText, setFormatEnvironment } from './formatter.js';
+import { resolveVocab, listVocab, labelFromUri, type VocabKey } from './vocabs.js';
 
 // ── Shared filter builder ────────────────────────────────────────────────────
 
@@ -87,6 +88,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
     },
     async (params) => {
       const env: WloEnvironment = params.environment ?? defaultEnv;
+      setFormatEnvironment(env);
       const maxResults = params.maxResults ?? 5;
 
       // Keyword match: split query into words, match if ANY word hits name/title/desc
@@ -215,6 +217,7 @@ Filters accept both German labels and full URIs.`,
     },
     async (params) => {
       const env: WloEnvironment = params.environment ?? defaultEnv;
+      setFormatEnvironment(env);
       const filters = buildFilterCriteria(params);
       const maxResults = params.maxResults ?? 8;
 
@@ -271,6 +274,7 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
     },
     async (params) => {
       const env: WloEnvironment = params.environment ?? defaultEnv;
+      setFormatEnvironment(env);
       const filter = (params.contentFilter ?? 'files') as 'files' | 'folders' | 'both';
       const maxResults = params.maxResults ?? 20;
       const skipCount = params.skipCount ?? 0;
@@ -381,6 +385,10 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
 
         const renderUrl = `https://redaktion.openeduhub.net/edu-sharing/components/render/${params.nodeId}`;
         lines.push(`WLO-URL: ${renderUrl}`);
+
+        const pageConfigRef = props['ccm:page_config_ref']?.[0];
+        const topicPageUrl = buildTopicPageUrl(env, params.nodeId, pageConfigRef);
+        if (topicPageUrl) lines.push(`Themenseite: ${topicPageUrl}`);
 
         const nodeType = props['cm:objecttype']?.[0];
         if (nodeType) lines.push(`Typ: ${nodeType}`);
@@ -540,6 +548,123 @@ Useful before calling search tools to find the correct filter values.`,
       }
 
       return { content: [{ type: 'text', text: lines.join('\n') }] };
+    },
+  );
+
+  // ── Tool 7: search_wlo_topic_pages ──────────────────────────────────────────
+  server.tool(
+    'search_wlo_topic_pages',
+    `Search for Themenseiten (topic pages) on WirLernenOnline.
+Themenseiten are curated page layouts with swimlanes, tailored to different target groups
+(Lehrkräfte, Lernende, Allgemein). They are linked to Sammlungen (collections).
+
+Two search modes:
+1. By topic (query): Searches collections first, then checks which ones have a Themenseite.
+2. By filters only: Lists all available Themenseiten, optionally filtered by target group or educational context.
+
+Returns the topic-page URL that can be opened directly in the browser.`,
+    {
+      query: z.string().optional().default('').describe(
+        'Thematic search query in German, e.g. "Physik" or "Farben". ' +
+        'Searches collections and checks for linked Themenseiten. Leave empty to list all.'
+      ),
+      targetGroup: z.enum(['teacher', 'learner', 'general']).optional().describe(
+        'Target audience: "teacher" (Lehrkräfte), "learner" (Lernende), "general" (Allgemein)'
+      ),
+      educationalContext: z.string().optional().describe(
+        'Educational level: e.g. "Grundschule", "Sekundarstufe I", "Schule", or full URI'
+      ),
+      collectionId: z.string().optional().describe(
+        'Directly check a specific collection (nodeId) for its Themenseite. ' +
+        'Bypasses the search – useful when you already have a collection from search_wlo_collections.'
+      ),
+      maxResults: z.number().int().min(1).max(20).optional().default(5),
+      environment: z.enum(['production', 'staging']).optional().describe(
+        'WLO environment: "production" (default) or "staging"'
+      ),
+    },
+    async (params) => {
+      const env: WloEnvironment = params.environment ?? defaultEnv;
+      const tg = params.targetGroup as TargetGroup | undefined;
+
+      try {
+        const results: ThemePageInfo[] = [];
+
+        // ── Mode A: Direct collection check ──────────────────────────────────
+        if (params.collectionId) {
+          const pages = await getCollectionThemePages(env, params.collectionId, tg);
+          results.push(...pages);
+        }
+        // ── Mode B: Topic-based search (collection → page_config_ref) ────────
+        else if (params.query?.trim()) {
+          const collections = await searchCollectionsByKeyword(env, params.query, 10);
+          for (const coll of collections) {
+            const cId = coll.ref?.id;
+            if (!cId) continue;
+            const pageConfigRef = coll.properties?.['ccm:page_config_ref']?.[0];
+            if (!pageConfigRef) continue;
+            const pages = await getCollectionThemePages(env, cId, tg);
+            results.push(...pages);
+            if (results.length >= (params.maxResults ?? 5)) break;
+          }
+        }
+        // ── Mode C: List all Themenseiten (page_variant API) ─────────────────
+        else {
+          const eduCtxUri = params.educationalContext
+            ? resolveVocab(params.educationalContext, 'educationalContext') ?? params.educationalContext
+            : undefined;
+          const variants = await searchPageVariants(env, {
+            isTemplate: false,
+            targetGroup: tg,
+            educationalContext: eduCtxUri,
+          }, params.maxResults ?? 5);
+
+          for (const v of variants) {
+            const vProps = v.properties ?? {};
+            results.push({
+              variantId: v.ref?.id ?? '',
+              variantName: vProps['cm:name']?.[0] || v.name || '',
+              targetGroup: vProps['ccm:page_variant_profiling_target_group']?.[0] || 'nicht gesetzt',
+              educationalContexts: vProps['ccm:educationalcontext'] ?? [],
+              isTemplate: false,
+              topicPageUrl: '',
+              collectionId: undefined,
+              collectionName: undefined,
+            });
+          }
+        }
+
+        if (results.length === 0) {
+          const hint = params.query
+            ? `Keine Themenseiten für "${params.query}" gefunden. Die Sammlung hat möglicherweise keine konfigurierte Themenseite (ccm:page_config_ref fehlt).`
+            : 'Keine Themenseiten gefunden.';
+          return { content: [{ type: 'text', text: hint }] };
+        }
+
+        // Format output
+        const lines: string[] = [`Gefundene Themenseiten: ${results.length}\n`];
+        for (const r of results.slice(0, params.maxResults ?? 5)) {
+          const parts: string[] = [];
+          parts.push(`## ${r.collectionName || r.variantName}`);
+          if (r.collectionId) parts.push(`Sammlung-nodeId: ${r.collectionId}`);
+          parts.push(`Variante-ID: ${r.variantId}`);
+          parts.push(`Zielgruppe: ${r.targetGroup}`);
+          if (r.educationalContexts.length) {
+            const labels = r.educationalContexts.map(u => {
+              const l = labelFromUri(u, 'educationalContext');
+              return l !== u ? l : u;
+            });
+            parts.push(`Bildungsstufe: ${labels.join(', ')}`);
+          }
+          if (r.topicPageUrl) parts.push(`Themenseite: ${r.topicPageUrl}`);
+          lines.push(parts.join('\n'));
+          lines.push('');
+        }
+        return { content: [{ type: 'text', text: lines.join('\n').trim() }] };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: 'text', text: `Fehler bei der Themenseiten-Suche: ${msg}` }], isError: true };
+      }
     },
   );
 

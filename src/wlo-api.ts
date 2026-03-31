@@ -42,6 +42,24 @@ const HEADERS = {
   'Content-Type': 'application/json',
 };
 
+const FRONTEND_BASE_URLS: Record<WloEnvironment, string> = {
+  production: 'https://redaktion.openeduhub.net/edu-sharing',
+  staging:    'https://repository.staging.openeduhub.net/edu-sharing',
+};
+
+/**
+ * Build the topic-pages URL for a collection that has ccm:page_config_ref.
+ * Returns null if pageConfigRef is falsy.
+ */
+export function buildTopicPageUrl(
+  env: WloEnvironment,
+  collectionId: string,
+  pageConfigRef?: string | null,
+): string | null {
+  if (!pageConfigRef) return null;
+  return `${FRONTEND_BASE_URLS[env]}/components/topic-pages?collectionId=${collectionId}`;
+}
+
 function base(env: WloEnvironment): string {
   return BASE_URLS[env];
 }
@@ -127,6 +145,7 @@ export async function searchCollectionsByKeyword(
     contentType: 'COLLECTIONS',
     maxItems: String(maxItems),
     skipCount: '0',
+    propertyFilter: '-all-',
   });
   const url = `${base(env)}/search/v1/queries/-home-/mds_oeh/collections?${params}`;
   const body = JSON.stringify({ criteria: [{ property: 'ngsearchword', values: [query] }] });
@@ -251,6 +270,125 @@ export async function getNodeParents(
   if (!res.ok) return [];
   const data = await res.json() as { nodes?: WloNode[]; parents?: WloNode[] };
   return data.nodes ?? data.parents ?? [];
+}
+
+// ── Theme pages (page_variant) ────────────────────────────────────────────────
+
+export type TargetGroup = 'teacher' | 'learner' | 'general';
+
+export interface ThemePageInfo {
+  variantId: string;
+  variantName: string;
+  targetGroup: string;
+  educationalContexts: string[];
+  isTemplate: boolean;
+  topicPageUrl: string;
+  collectionId?: string;
+  collectionName?: string;
+}
+
+/**
+ * POST /search/v1/queries/-home-/mds_oeh/page_variant
+ * Search for page_variant nodes (Themenseiten-Varianten).
+ * Supports filtering by is_template, target_group, and educationalcontext.
+ * Does NOT support full-text search (ngsearchword returns 0).
+ */
+export async function searchPageVariants(
+  env: WloEnvironment,
+  options: {
+    isTemplate?: boolean;
+    targetGroup?: TargetGroup;
+    educationalContext?: string;
+  } = {},
+  maxItems = 50,
+): Promise<WloNode[]> {
+  const criteria: SearchCriterion[] = [];
+  criteria.push({
+    property: 'ccm:page_variant_is_template',
+    values: [String(options.isTemplate ?? false)],
+  });
+  if (options.targetGroup) {
+    criteria.push({
+      property: 'ccm:page_variant_profiling_target_group',
+      values: [options.targetGroup],
+    });
+  }
+  if (options.educationalContext) {
+    criteria.push({
+      property: 'ccm:educationalcontext',
+      values: [options.educationalContext],
+    });
+  }
+
+  const params = new URLSearchParams({
+    contentType: 'ALL',
+    maxItems: String(maxItems),
+    skipCount: '0',
+    propertyFilter: '-all-',
+  });
+  const url = `${base(env)}/search/v1/queries/-home-/mds_oeh/page_variant?${params}`;
+  const body = JSON.stringify({ criteria });
+  const res = await fetch(url, { method: 'POST', headers: HEADERS, body });
+  if (!res.ok) return [];
+  const data = await res.json() as { nodes?: WloNode[] };
+  return data.nodes ?? [];
+}
+
+/**
+ * Given a collection nodeId, check if it has ccm:page_config_ref and resolve
+ * the theme page variants underneath it.
+ * Returns an array of ThemePageInfo with variant details.
+ */
+export async function getCollectionThemePages(
+  env: WloEnvironment,
+  collectionId: string,
+  targetGroup?: TargetGroup,
+): Promise<ThemePageInfo[]> {
+  const node = await getNodeMetadata(env, collectionId);
+  if (!node) return [];
+
+  const props = node.properties ?? {};
+  const pageConfigRef = props['ccm:page_config_ref']?.[0];
+  if (!pageConfigRef) return [];
+
+  // Extract nodeId from "workspace://SpacesStore/{id}"
+  const configId = pageConfigRef.replace('workspace://SpacesStore/', '');
+
+  // Config folder → children (page_config nodes) → their children (PAGE_VARIANT)
+  const configChildren = await getChildCollections(env, configId, 50);
+  const results: ThemePageInfo[] = [];
+  const collectionName = props['cclom:title']?.[0] || props['cm:name']?.[0] || node.name || '';
+  const topicPageUrl = buildTopicPageUrl(env, collectionId, pageConfigRef) ?? '';
+
+  for (const configNode of configChildren) {
+    const configNodeId = configNode.ref?.id;
+    if (!configNodeId) continue;
+
+    // Get variants (files) under each page_config
+    const variantResp = await getCollectionContents(env, configNodeId, 'both', 50);
+    for (const variant of variantResp.nodes) {
+      const vProps = variant.properties ?? {};
+      const isTemplate = vProps['ccm:page_variant_is_template']?.[0] === 'true';
+      if (isTemplate) continue;
+
+      const vTargetGroup = vProps['ccm:page_variant_profiling_target_group']?.[0] || '';
+      if (targetGroup && vTargetGroup && vTargetGroup !== targetGroup) continue;
+
+      const eduContexts = vProps['ccm:educationalcontext'] ?? [];
+
+      results.push({
+        variantId: variant.ref?.id ?? '',
+        variantName: vProps['cm:name']?.[0] || variant.name || '',
+        targetGroup: vTargetGroup || 'nicht gesetzt',
+        educationalContexts: eduContexts,
+        isTemplate: false,
+        topicPageUrl,
+        collectionId,
+        collectionName,
+      });
+    }
+  }
+  return results;
 }
 
 // ── Web content extraction ────────────────────────────────────────────────────
