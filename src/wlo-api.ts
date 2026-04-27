@@ -26,9 +26,28 @@ export interface WloNode {
   name?: string;
   title?: string;
   isDirectory?: boolean;
+  /** edu-sharing object type — `ccm:io` (file) or `ccm:map` (collection). */
+  type?: string;
+  /** MIME type, e.g. `application/pdf` (only on `ccm:io` nodes). */
+  mimetype?: string;
+  /** Coarse mediatype label, e.g. `file-pdf`, `file-video`. */
+  mediatype?: string;
+  /** File size in bytes (only on file nodes with binary content). */
+  size?: number;
+  /** Direct binary download URL — works without auth; null if no binary content. */
+  downloadUrl?: string | null;
   properties?: Record<string, string[]>;
-  preview?: { url?: string; isIcon?: boolean };
-  content?: { url?: string };
+  preview?: {
+    url?: string;
+    /** `true` = generic mediatype icon, `false` = real generated thumbnail */
+    isIcon?: boolean;
+    isGenerated?: boolean;
+  };
+  /**
+   * In-repo viewer URL (PDF/video preview component). Null when the node
+   * has no binary attachment (e.g. external link nodes via `ccm:wwwurl`).
+   */
+  content?: { url?: string; originalUrl?: string; hash?: string; version?: string };
   collection?: { description?: string; title?: string; childCollectionsCount?: number };
 }
 
