@@ -8,14 +8,47 @@ Kompatibel mit **OpenAI** (Responses API + native MCP), **Anthropic Claude** und
 
 ## Inhaltsverzeichnis
 
-1. [Installation](#installation)
-2. [Tools im Überblick](#tools-im-überblick)
-3. [Tools – Detail & API-Endpunkte](#tools--detail--api-endpunkte)
-4. [Filter-Parameter](#filter-parameter)
-5. [Deployment](#deployment)
-6. [Konfiguration in AI-Clients](#konfiguration-in-ai-clients)
-7. [Architektur](#architektur)
-8. [Kompatibilität](#kompatibilität)
+1. [Was ist neu in v2](#was-ist-neu-in-v2)
+2. [Installation](#installation)
+3. [Tools im Überblick](#tools-im-überblick)
+4. [Tools – Detail & API-Endpunkte](#tools--detail--api-endpunkte)
+5. [Filter-Parameter & Vokabular](#filter-parameter--vokabular)
+6. [Output-Formate (markdown vs. json)](#output-formate-markdown-vs-json)
+7. [Determinismus & Stabilität](#determinismus--stabilität)
+8. [Deployment](#deployment)
+9. [Konfiguration in AI-Clients](#konfiguration-in-ai-clients)
+10. [Architektur](#architektur)
+11. [Migration v1 → v2](#migration-v1--v2)
+12. [Kompatibilität](#kompatibilität)
+
+---
+
+## Was ist neu in v2
+
+### Hinzugekommen
+- **`get_subject_portals`** — listet die Fachportale (Top-Level-Sammlungen unter dem WLO-Wurzelknoten) deterministisch alphabetisch.
+- **`browse_collection_tree`** — strukturierter Drilldown in Sub-Sammlungen (Tiefe 1 oder 2), optional mit File-Counts.
+- **`wlo_health_check`** — Probe gegen die WLO-API, gibt Latenz + Status zurück.
+- **`get_nodes_details`** — Bulk-Metadata für mehrere `nodeIds` parallel.
+- **`outputFormat: "json"`** für *alle* Such- und Detail-Tools — strukturierte Daten statt Markdown-Parsing.
+- **`excludeNodeIds: string[]`** für die drei Such-Tools — bereits gesehene IDs aus Folge-Calls ausblenden.
+- **License- und TargetGroup-Vocabularies** in `lookup_wlo_vocabulary` (`vocabulary: "license"` / `"targetGroup"`).
+
+### Verbessert
+- **`search_wlo_topic_pages`**:
+  - Mode C (Liste-aller) zeigt jetzt die **Sammlungsnamen** als Titel statt kryptischer `PAGE_VARIANT_TEMPLATE_xxx`-Slugs (Auto-Resolve via `getNodeParents`).
+  - Mehrere Varianten derselben Sammlung werden per `mergeVariants=true` (Default) zu einer Karte zusammengefasst.
+  - **`targetGroupLabel`** liefert lesbare Labels (`"Lehrkräfte"` / `"Lernende"` / `"Allgemein"`) statt Slugs / `ccrep://`-URIs.
+  - **`sort: "alpha" | "relevance"`** mit deterministischem Tie-Breaker auf `nodeId`.
+- **`get_node_details`**:
+  - Output-Felder sind jetzt **identisch zu `formatNode()`** der Such-Tools — `disciplines`, `educationalContexts`, `userRoles`, `learningResourceTypes`, `license` als **menschenlesbare Labels** (`"Mathematik"`, `"CC BY-SA 4.0"`) statt URIs.
+  - Optional `includeRaw: true` zeigt zusätzlich die unaufgelösten URIs für Debugging / Spezialfälle.
+- **Lizenz-Mapping**: Roh-Keys wie `CC_BY_SA` werden überall zu `"CC BY-SA 4.0"` aufgelöst.
+- **Reranker** (`reranker.ts`): deterministischer Tie-Breaker auf `nodeId` bei gleichem Score; neue `sortByTitle()` für stabile alphabetische Sortierung.
+
+### Entfernt (Breaking Changes)
+- `get_wirlernenonline_info`, `get_edu_sharing_network_info`, `get_edu_sharing_product_info`, `get_metaventis_info` — die Webseiten-Crawler-Tools sind weg. Diese Aufgabe übernimmt jetzt das Konsumenten-eigene RAG (z.B. das BadBoerdi-RAG).
+- Damit auch `WEB_CONTENT_WHITELIST` und `fetchWebContent()` aus `wlo-api.ts` entfernt.
 
 ---
 
@@ -29,64 +62,58 @@ Kompatibel mit **OpenAI** (Responses API + native MCP), **Anthropic Claude** und
 ### Lokale Installation
 
 ```bash
-# Repository klonen
 git clone https://github.com/yourorg/wlomcp.git
 cd wlomcp
-
-# Abhängigkeiten installieren
 npm install
-
-# TypeScript kompilieren
 npm run build
 ```
 
 ### Umgebungsvariablen
 
 ```bash
-# Optionale Konfiguration (Standard: production)
 cp .env.example .env
 ```
 
 | Variable | Werte | Standard | Beschreibung |
 |---|---|---|---|
-| `WLO_ENV` | `production`, `staging` | `production` | Ziel-Umgebung der WLO API |
-| `PORT` | Zahl | `3000` | HTTP-Port (nur im HTTP-Modus) |
+| `WLO_ENV` | `production`, `staging` | `production` | Ziel-Umgebung der WLO-API |
+| `PORT` | Zahl | `3000` | HTTP-Port (nur HTTP-Modus) |
 
 ### Server starten
 
 ```bash
-# HTTP-Modus (für REST/MCP-Clients)
-node dist/http.js
-# → Server läuft auf http://localhost:3000/mcp
+node dist/http.js     # HTTP-Modus → http://localhost:3000/mcp
+node dist/stdio.js    # stdio (Claude Desktop, lokale Clients)
 
-# stdio-Modus (für Claude Desktop, lokale AI-Clients)
-node dist/stdio.js
-
-# Entwicklung mit Auto-Reload
-npm run dev          # stdio
-npm run dev:http     # HTTP
+npm run dev           # stdio mit Auto-Reload
+npm run dev:http      # HTTP mit Auto-Reload
 ```
 
 ---
 
 ## Tools im Überblick
 
-| # | Tool | Beschreibung |
-|---|---|---|
-| 1 | `search_wlo_collections` | Sammlungen (= Themenseiten) suchen – primär via Volltext-API, Fallback via Baum-Traversierung |
-| 2 | `search_wlo_content` | Globale Volltextsuche nach Bildungsinhalten (Dateien, Videos, Arbeitsblätter) |
-| 3 | `get_collection_contents` | Inhalte oder Untersammlungen einer Sammlung abrufen – mit Pagination via `skipCount` |
-| 4 | `get_node_details` | Detailmetadaten, Volltext und Eltern-Sammlungen für eine Node-ID |
-| 5a | `get_wirlernenonline_info` | Infos von der WirLernenOnline-Projektwebseite (mehrstufiges Crawling) |
-| 5b | `get_edu_sharing_network_info` | Infos von edu-sharing-network.org (Community, Projekte, Events) |
-| 5c | `get_edu_sharing_product_info` | Infos von edu-sharing.com (Produkt, Dokumentation, Features) |
-| 5d | `get_metaventis_info` | Infos von metaventis.com (Unternehmen, Dienstleistungen) |
-| 6 | `lookup_wlo_vocabulary` | Gültige Filterwerte für Bildungsstufe, Fach, Zielgruppe, Ressourcentyp |
-| 7 | `search_wlo_topic_pages` | Themenseiten suchen – kuratierte Layouts mit Swimlanes, nach Zielgruppe filterbar |
+| # | Tool | Zweck | Output-Formate |
+|---|---|---|---|
+| 1 | `search_wlo_collections` | Sammlungen suchen (Volltext + Tree-Fallback) | markdown / json |
+| 2 | `search_wlo_content` | Globale Volltextsuche nach Bildungsinhalten | markdown / json |
+| 3 | `get_collection_contents` | Inhalte/Sub-Sammlungen einer Sammlung (paginierbar) | markdown / json |
+| 4 | `get_node_details` | Detail-Metadaten + optional Volltext + Eltern | markdown / json |
+| 5 | `lookup_wlo_vocabulary` | Vokabular-Werte: Bildungsstufe, Fach, Zielgruppe, LRT, Lizenzen, TargetGroup | markdown |
+| 6 | `search_wlo_topic_pages` | Themenseiten finden / listen, Varianten zusammenfassen | markdown / json |
+| 7 | `get_subject_portals` | Fachportale (Top-Level-Sammlungen unter WLO-Root) | markdown / json |
+| 8 | `browse_collection_tree` | Drilldown in Sub-Sammlungen (Tiefe 1–2), optional mit File-Counts | markdown / json |
+| 9 | `wlo_health_check` | Status + Latenz der WLO-API | json |
+| 10 | `get_nodes_details` | Bulk-Metadata für mehrere `nodeIds` parallel | json |
 
-> **Konzept:** In WLO sind **Sammlungen** und **Themenseiten** dasselbe. Eine Sammlung wird im WLO-Repository als Themenseite angezeigt und bündelt Bildungsinhalte in **Schwimmlinien (Swimlanes/Karussells)**. Untersammlungen entsprechen Unter-Themenseiten. Sammlungen mit `ccm:page_config_ref` haben eine kuratierte **Themenseite** mit zielgruppenspezifischen Varianten (Lehrkräfte, Lernende, Allgemein).
+> **Konzept:** In WLO sind **Sammlungen** und **Themenseiten** dasselbe. Eine Sammlung wird im Repository als Themenseite angezeigt und bündelt Inhalte in **Schwimmlinien (Swimlanes/Karussells)**. Sub-Sammlungen entsprechen Unter-Themenseiten. Sammlungen mit `ccm:page_config_ref` haben eine kuratierte **Themenseite** mit zielgruppenspezifischen Varianten (Lehrkräfte / Lernende / Allgemein).
 
-> **Tool-Routing:** Das LLM sollte `search_wlo_content` (nicht `search_wlo_collections`) nutzen, wenn nach konkreten Inhaltstypen gefragt wird (Videos, Arbeitsblätter, PDFs). `search_wlo_topic_pages` nutzen, wenn explizit nach Themenseiten, kuratierten Seiten oder zielgruppenspezifischen Ansichten gefragt wird. Die Web-Tools (`get_*_info`) sollten genutzt werden, wenn nach den Projekten/Plattformen selbst gefragt wird – nicht nach Lernmaterialien.
+> **Tool-Routing-Heuristik (für LLMs):**
+> - User fragt nach **Material/Inhaltstyp** (Video, Arbeitsblatt, …) → `search_wlo_content`
+> - User fragt nach **Themenseite/Sammlung** zu einem Thema → `search_wlo_topic_pages` (Mode B mit query)
+> - User will durch ein Fach **navigieren** (Drilldown) → erst `get_subject_portals`, dann `browse_collection_tree`
+> - User klickt eine Karte → `get_node_details` mit dieser nodeId
+> - Bot zeigt 10 Karten und braucht Metadaten zu allen → `get_nodes_details(nodeIds=[...])` (1 Aufruf statt 10)
 
 ---
 
@@ -94,333 +121,408 @@ npm run dev:http     # HTTP
 
 ### 1. `search_wlo_collections`
 
-Sucht thematische Sammlungen (Themenseiten) im WLO-Repository.
+Sucht thematische Sammlungen. Drei-stufige Strategie: Volltext-API → Baum-Traversierung Level 2 → Level 3.
 
-**Parameter:**
-
-| Parameter | Typ | Standard | Beschreibung |
+| Parameter | Typ | Default | Beschreibung |
 |---|---|---|---|
-| `query` | string | `""` | Suchbegriff, z.B. `"Algebra"`, `"Klimawandel"`. Leer = alle Top-Level-Sammlungen anzeigen |
-| `parentNodeId` | string | – | NodeId einer Eltern-Sammlung für Suche im Teilbaum (z.B. Mathematik-NodeId, um darin nach Algebra zu suchen) |
-| `educationalContext` | string | – | Bildungsstufe: `"Primarstufe"`, `"Sekundarstufe I"` oder URI |
-| `discipline` | string | – | Fach: `"Mathematik"`, `"Biologie"` oder URI |
-| `userRole` | string | – | Zielgruppe: `"Lehrer/in"`, `"Lerner/in"` oder URI |
-| `maxResults` | int | `5` | Max. Ergebnisse (1–20) |
+| `query` | string | `""` | Suchbegriff. Leer = Top-Level-Sammlungen unter Root oder `parentNodeId` |
+| `parentNodeId` | string | – | nodeId einer Eltern-Sammlung für Sub-Tree-Suche |
+| `educationalContext` | string | – | Bildungsstufe (Label oder URI) |
+| `discipline` | string | – | Fach (Label oder URI) |
+| `userRole` | string | – | Zielgruppe (Label oder URI) |
+| `maxResults` | int | `5` | 1–20 |
+| `excludeNodeIds` | string[] | – | Diese IDs in der Antwort überspringen |
+| `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
 | `environment` | enum | `production` | `"production"` oder `"staging"` |
 
-**Verwendete API-Endpunkte:**
-
+**API-Endpunkte:**
 ```
-# Primär: Volltext-Sammlungssuche (gibt isDirectory=true Nodes zurück)
-POST /search/v1/queries/-home-/mds_oeh/collections?contentType=COLLECTIONS&maxItems={n}
-
-Body: { "criteria": [ { "property": "ngsearchword", "values": ["..."] } ] }
-
-# Fallback: Kinder-Traversierung (wenn parentNodeId gegeben oder Direktsuche leer)
-GET /node/v1/nodes/-home-/{nodeId}/children?filter=folders&maxItems=100&propertyFilter=-all-
+POST /search/v1/queries/-home-/mds_oeh/collections?contentType=COLLECTIONS    (Volltext)
+GET  /node/v1/nodes/-home-/{nodeId}/children?filter=folders                   (Tree)
 ```
-
-**Suchstrategie:**
-
-1. **Direktsuche (primär):** Bei gesetztem `query` ohne `parentNodeId` → Volltext-API mit `contentType=COLLECTIONS`. Liefert echte Collection-Nodes (`isDirectory=true`). Eigenschaften wie Titel und Beschreibung sind direkt am Node (`node.collection.description`).
-2. **Baum-Traversierung (Fallback):** Bei `parentNodeId` oder leerem Ergebnis → Kinder-Traversierung ab der Startnode (WLO-Root oder gegebener Parent). Keyword-Matching auf `cm:name`, `cclom:title`, `cclom:general_description`. Suchbegriff wird in Einzelwörter zerlegt – Treffer bei jedem Wort.
-3. **Formatierung:** Jede Sammlung wird mit `nodeId`, Titel, Beschreibung, Fach, Bildungsstufe, Schlagworten, WLO-URL und `Typ: Sammlung` ausgegeben.
 
 ---
 
 ### 2. `search_wlo_content`
 
-Globale Volltextsuche nach einzelnen Bildungsmaterialien (Dateien, Videos, Arbeitsblätter, etc.).
+Globale Volltextsuche nach Bildungsmaterialien (Files). Mit **Multi-Query-Expansion + RRF** (clientseitig, ohne Transformer-Modell — Vercel-tauglich).
 
-**Parameter:**
-
-| Parameter | Typ | Standard | Beschreibung |
+| Parameter | Typ | Default | Beschreibung |
 |---|---|---|---|
-| `query` | string | **Pflicht** | Suchbegriff, z.B. `"Bruchrechnung Grundschule"` |
+| `query` | string | **Pflicht** | Suchbegriff |
 | `educationalContext` | string | – | Bildungsstufe |
 | `discipline` | string | – | Fach |
 | `userRole` | string | – | Zielgruppe |
-| `learningResourceType` | string | – | Ressourcentyp: `"Arbeitsblatt"`, `"Video"`, etc. |
-| `publisher` | string | – | Anbieter/Quelle: `"Klexikon"`, `"Serlo"`, `"ZUM"`, etc. |
-| `maxResults` | int | `8` | Max. Ergebnisse (1–20) |
-| `environment` | enum | `production` | `"production"` oder `"staging"` |
+| `learningResourceType` | string | – | Ressourcentyp (Arbeitsblatt, Video, …) |
+| `publisher` | string | – | Anbieter-Filter (Klexikon, Serlo, ZUM, …) |
+| `maxResults` | int | `8` | 1–20 |
+| `excludeNodeIds` | string[] | – | IDs überspringen |
+| `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
+| `environment` | enum | `production` | – |
 
-**Verwendete API-Endpunkte:**
-
-```
-POST /search/v1/queries/-home-/mds_oeh/ngsearch?contentType=FILES&maxItems={n}&skipCount=0&propertyFilter=-all-
-
-Body: { "criteria": [ { "property": "ngsearchword", "values": ["..."] }, ... ] }
-```
-
-Mögliche `criteria`-Properties:
-
-| Property | Zweck |
-|---|---|
-| `ngsearchword` | Volltext-/Titelsuche |
-| `ccm:taxonid` | Fach-URI (z.B. `http://w3id.org/openeduhub/vocabs/discipline/380`) |
-| `ccm:educationalcontext` | Bildungsstufe-URI |
-| `ccm:educationalintendedenduserrole` | Zielgruppen-URI |
-| `ccm:oeh_lrt_aggregated` | Lernressourcentyp-URI |
-| `ccm:oeh_publisher_combined` | Publisher/Anbieter-Filter (z.B. `"Klexikon"`) |
-
-**Nachbereitung (Multi-Query + Reranking):**
-
-1. **Query Expansion:** Aus dem Suchbegriff werden mehrere Varianten generiert (Volltext, Titelsuche, Keywords, Synonyme, Einzelterme).
-2. **Parallele API-Anfragen:** Alle Varianten werden gleichzeitig abgefragt (bis zu 40 Ergebnisse pro Variante).
-3. **Reciprocal Rank Fusion (RRF):** Ergebnisse aus allen Varianten werden nach RRF zusammengeführt.
-4. **Qualitätsscoring:** Jeder Node erhält einen Score aus: Titelrelevanz (30 Pt.), Keywords (10 Pt.), Beschreibung (8 Pt.), Metadatenqualität. Qualitätsscore dominiert (80%), RRF ist sekundär (10%), Multi-Appearance-Bonus (10%).
-5. **Filter-Kriterien** (Fach, Stufe, etc.) werden direkt als `criteria` an die API übergeben, nicht als Post-Filter.
+**Reranking-Pipeline:**
+1. **Query Expansion**: Volltext, Title-Match, Keyword-Hits, Synonym-Map, Einzelterme
+2. **Parallele API-Calls** (bis zu 40 Treffer / Variante)
+3. **RRF (Reciprocal Rank Fusion)** mit Variant-Gewichtung
+4. **Quality Score** (Titel: 30 Pt., Keywords: 10 Pt., Beschreibung: 8 Pt., Metadaten-Qualität)
+5. **Endformel**: `0.8 × quality + 0.1 × rrf + 0.1 × multi_appearance_bonus`
+6. **Tie-Breaker**: `nodeId.localeCompare()` für deterministische Reihenfolge bei gleichen Scores
 
 ---
 
 ### 3. `get_collection_contents`
 
-Ruft die Inhalte (Dateien/Untersammlungen) einer bekannten Sammlung ab.
+Inhalte einer Sammlung. Unterstützt Pagination via `skipCount` und Filter.
 
-**Parameter:**
-
-| Parameter | Typ | Standard | Beschreibung |
+| Parameter | Typ | Default | Beschreibung |
 |---|---|---|---|
-| `nodeId` | string | **Pflicht** | NodeId der Sammlung (aus `search_wlo_collections`) |
-| `query` | string | – | Optionaler Suchbegriff zum Reranking der Ergebnisse |
-| `contentFilter` | enum | `"files"` | `"files"` = Lernmaterialien, `"folders"` = Unter-Sammlungen, `"both"` = alles |
-| `includeSubcollections` | bool | `false` | Wenn `true`: rekursiv alle Untersammlungen traversieren |
-| `maxResults` | int | `20` | Max. Ergebnisse (1–100) |
-| `skipCount` | int | `0` | Offset für Pagination (0 = erste Seite, 4 = zweite Seite bei maxResults=4) |
-| `environment` | enum | `production` | `"production"` oder `"staging"` |
+| `nodeId` | string | **Pflicht** | nodeId der Sammlung |
+| `query` | string | – | Optional zum Reranking |
+| `contentFilter` | enum | `"files"` | `"files"` / `"folders"` / `"both"` |
+| `includeSubcollections` | bool | `false` | Rekursive BFS-Traversierung (nur bei `files`) |
+| `maxResults` | int | `20` | 1–100 |
+| `skipCount` | int | `0` | Pagination-Offset |
+| `excludeNodeIds` | string[] | – | IDs überspringen |
+| `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
+| `environment` | enum | `production` | – |
 
-**Verwendete API-Endpunkte:**
-
-```
-# Inhalte (Dateien)
-GET /node/v1/nodes/-home-/{nodeId}/children?filter=files&maxItems={n}&skipCount={s}&propertyFilter=-all-
-
-# Untersammlungen
-GET /node/v1/nodes/-home-/{nodeId}/children?filter=folders&maxItems={n}&skipCount={s}&propertyFilter=-all-
-
-# Alles (kein Filter)
-GET /node/v1/nodes/-home-/{nodeId}/children?maxItems={n}&skipCount={s}&propertyFilter=-all-
-```
-
-**Pagination:** Die Antwort enthält `pagination.total`. Mit `skipCount` kann seitenweise durch Inhalte geblättert werden, z.B. `maxResults=4, skipCount=0` (1–4), `skipCount=4` (5–8) usw.
-
-**Nachbereitung:**
-
-- Bei `includeSubcollections=true`: BFS-Traversierung (Breadth-First) des Sammlungsbaums. Für jede Sammlung werden erst die Dateien geholt, dann die Untersammlungen in eine Queue eingefügt. Abbruch bei `maxResults`.
-- Optional: Falls `query` angegeben, werden die Ergebnisse per Relevanz-Reranking (Titelvergleich) umsortiert.
+> **Tipp:** Statt `contentFilter="folders"` ist `browse_collection_tree` (Tool 8) klarer und liefert direkt File-Counts.
 
 ---
 
 ### 4. `get_node_details`
 
-Liefert detaillierte Informationen zu einem einzelnen Node (Content-Item oder Sammlung).
+Detail-Metadaten zu einem einzelnen Node (Content oder Sammlung).
 
-**Parameter:**
-
-| Parameter | Typ | Standard | Beschreibung |
+| Parameter | Typ | Default | Beschreibung |
 |---|---|---|---|
-| `nodeId` | string | **Pflicht** | Node-ID aus Suchergebnissen |
-| `includeTextContent` | bool | `false` | Gespeicherten Volltext (gecrawlte Webseite/PDF) abrufen |
-| `includeParents` | bool | `false` | Eltern-Sammlungen des Nodes abrufen |
-| `environment` | enum | `production` | `"production"` oder `"staging"` |
+| `nodeId` | string | **Pflicht** | – |
+| `includeTextContent` | bool | `false` | Gespeicherten Volltext (gecrawlt) abrufen, max. 4000 Zeichen |
+| `includeParents` | bool | `false` | Eltern-Sammlungen mitliefern |
+| `includeRaw` | bool | `false` | Zusätzlich die rohen URI-Werte (vor Label-Resolution) |
+| `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
+| `environment` | enum | `production` | – |
 
-**Verwendete API-Endpunkte:**
-
+**Output-Konsistenz**: Im JSON-Modus liefert `get_node_details` **dieselben Felder** wie ein Eintrag aus `search_wlo_*` (Output-Format `formatNode()`):
+```json
+{
+  "nodeId": "bd8be6d5-…",
+  "title": "Mathematik",
+  "description": "…",
+  "keywords": ["…"],
+  "disciplines": ["Mathematik"],
+  "educationalContexts": ["Sekundarstufe i", "Hochschule"],
+  "userRoles": [],
+  "learningResourceTypes": [],
+  "license": "CC BY-SA 4.0",
+  "publisher": "ZUM",
+  "url": "https://…",
+  "previewUrl": "https://…",
+  "topicPageUrl": "https://…/topic-pages?collectionId=…",
+  "renderUrl": "https://…/components/render/…",
+  "nodeType": "collection",
+  "parents": [{"nodeId": "…", "title": "…"}],   // wenn includeParents
+  "textContent": "…",                             // wenn includeTextContent
+  "raw": { … }                                    // wenn includeRaw
+}
 ```
-# Metadaten (immer)
-GET /node/v1/nodes/-home-/{nodeId}/metadata?propertyFilter=-all-
-
-# Gespeicherter Volltext (optional, wenn includeTextContent=true)
-GET /node/v1/nodes/-home-/{nodeId}/textContent
-
-# Eltern-Sammlungen (optional, wenn includeParents=true)
-GET /node/v1/nodes/-home-/{nodeId}/parents?propertyFilter=-all-
-```
-
-**Nachbereitung:**
-
-- Aus den Rohdaten werden Titel, Beschreibung, Schlagworte, Fach-URI, Bildungsstufe-URI, Lizenz, Anbieter, URL und WLO-Render-URL extrahiert.
-- `textContent`: Der gecrawlte Volltext ist nicht für alle Nodes verfügbar. Wenn vorhanden, wird er auf 2.000 Zeichen gekürzt.
-- `parents`: Gibt die direkten Eltern-Sammlungen zurück (Name + NodeId). Nützlich um herauszufinden, in welcher Themenseite ein Inhalt eingebettet ist.
 
 ---
 
-### 5. Web-Informations-Tools (4 Tools)
+### 5. `lookup_wlo_vocabulary`
 
-Die vier Web-Tools rufen Informationen von den Projektwebseiten ab. Jedes Tool ist einer Domain fest zugeordnet und wird vom LLM anhand der Themen-Keywords ausgewählt.
+Listet Vokabular-Werte. Quelle: lokale `src/vocabs.ts` (keine API-Calls).
 
-| Tool | Base URL | Trigger-Keywords |
-|---|---|---|
-| `get_wirlernenonline_info` | `https://www.wirlernenonline.de` | WLO, WirLernenOnline, OER, Fachportale, Qualitätssicherung, Mitmachen, Informatik, Deutsch, Medienbildung, ComeIn |
-| `get_edu_sharing_network_info` | `https://edu-sharing-network.org` | edu-sharing Vernetzung, JOINTLY, ITsJOINTLY, BIRD, Bildungsraum Digital, Hackathon, OER-Sommercamp |
-| `get_edu_sharing_product_info` | `https://edu-sharing.com` | edu-sharing Produkt, Repository, Suchmaschine, Moodle Integration, Cloudspeicher, Plugins, Dokumentation, Demo |
-| `get_metaventis_info` | `https://metaventis.com` | metaVentis, Schulcloud, IDM, Autoren-Lösung, F&E, Firmenwissen und E-Learning |
-
-**Parameter (alle 4 Tools identisch):**
-
-| Parameter | Typ | Standard | Beschreibung |
-|---|---|---|---|
-| `path` | string | `""` | Unterseiten-Pfad, z.B. `"/fachportale/informatik"`. Leer = Hauptseite |
-| `maxLength` | int | `8000` | Max. Zeichen im Markdown-Output (500–20000) |
-
-**Verwendeter externer Dienst:**
-
-```
-POST https://text-extraction.staging.openeduhub.net/from-url
-
-Body: { "url": "...", "method": "browser", "output_format": "markdown" }
-```
-
-Der Dienst rendert die Seite mit einem Headless-Browser und extrahiert den Textinhalt als Markdown (JavaScript-gerenderte Seiten werden korrekt erfasst).
-
-**Mehrstufiges Crawling (bis 5 Ebenen):**
-
-Jedes Tool unterstützt eine LLM-gesteuerte mehrstufige Exploration:
-
-1. Tool ohne `path` aufrufen → Hauptseite laden, Navigationslinks entdecken
-2. Den **einen** relevantesten Link identifizieren → Tool erneut mit `path: "/unterseite"` aufrufen
-3. Schritte 1–2 wiederholen bis max. **5 Ebenen** oder ausreichend Information vorhanden
-4. Nur **einen Link pro Ebene** folgen (keine parallelen Abrufe auf gleicher Tiefe)
-
-**Whitelist erweitern:** In `src/wlo-api.ts` → `WEB_CONTENT_WHITELIST` Array anpassen.
+| Parameter | Werte |
+|---|---|
+| `vocabulary` | `educationalContext`, `discipline`, `userRole`, `lrt`, `license`, `targetGroup` |
 
 ---
 
-### 6. `lookup_wlo_vocabulary`
+### 6. `search_wlo_topic_pages`
 
-Listet alle gültigen Werte und URIs für die Filter-Parameter auf.
+Themenseiten finden, listen oder eine spezifische Sammlung prüfen.
 
-**Parameter:**
-
-| Parameter | Typ | Beschreibung |
-|---|---|---|
-| `vocabulary` | enum | `"educationalContext"`, `"discipline"`, `"userRole"`, `"lrt"` |
-
-**Keine API-Anfrage** – die Vocabularies sind lokal in `src/vocabs.ts` hinterlegt (aus den offiziellen WLO-Vokabulardateien generiert).
-
----
-
-### 7. `search_wlo_topic_pages`
-
-Sucht Themenseiten auf WirLernenOnline. Themenseiten sind kuratierte Layouts mit Swimlanes, zugeschnitten auf verschiedene Zielgruppen (Lehrkräfte, Lernende, Allgemein). Sie sind an Sammlungen gekoppelt über die Property `ccm:page_config_ref`.
-
-**Parameter:**
-
-| Parameter | Typ | Standard | Beschreibung |
+| Parameter | Typ | Default | Beschreibung |
 |---|---|---|---|
-| `query` | string | `""` | Thematische Suche, z.B. `"Physik"` oder `"Farben"`. Sucht Sammlungen und prüft ob Themenseite vorhanden. Leer = alle Themenseiten listen |
-| `targetGroup` | enum | – | Zielgruppe: `"teacher"` (Lehrkräfte), `"learner"` (Lernende), `"general"` (Allgemein) |
-| `educationalContext` | string | – | Bildungsstufe: `"Grundschule"`, `"Sekundarstufe I"` oder URI |
-| `collectionId` | string | – | Direkt-Check einer Sammlung auf Themenseite (NodeId). Umgeht die Suche – nützlich wenn bereits eine Sammlung aus `search_wlo_collections` vorliegt |
-| `maxResults` | int | `5` | Max. Ergebnisse (1–20) |
-| `environment` | enum | `production` | `"production"` oder `"staging"` |
+| `query` | string | `""` | Thematische Suche (Mode B) |
+| `targetGroup` | enum | – | `"teacher"` / `"learner"` / `"general"` |
+| `educationalContext` | string | – | Bildungsstufe |
+| `collectionId` | string | – | Direkt-Check einer Sammlung (Mode A) |
+| `mergeVariants` | bool | `true` | Mehrere Varianten derselben Sammlung in eine Karte zusammenfassen |
+| `sort` | enum | `"alpha"` | `"alpha"` (deterministisch) oder `"relevance"` |
+| `maxResults` | int | `5` | 1–20 |
+| `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
 
 **Drei Suchmodi:**
 
-1. **Mode A – Direkt-Check** (`collectionId` gesetzt): Prüft die Sammlung auf `ccm:page_config_ref`, traversiert die Config-Kinder → Varianten.
-2. **Mode B – Thematische Suche** (`query` gesetzt): Sucht erst Sammlungen per Keyword, filtert auf `page_config_ref`, löst Varianten auf.
-3. **Mode C – Alle auflisten** (kein `query`, kein `collectionId`): Nutzt die `page_variant` API, optional gefiltert nach `targetGroup` und `educationalContext`.
+1. **Mode A — Direkt-Check** (`collectionId` gesetzt): prüft `ccm:page_config_ref` der Sammlung, traversiert Config-Kinder → Varianten
+2. **Mode B — Thematische Suche** (`query` gesetzt): Sucht Sammlungen per Keyword, filtert auf `page_config_ref`
+3. **Mode C — Alle auflisten** (kein `query`, kein `collectionId`): Nutzt die `page_variant`-API. Variant-Owner-Sammlung wird über `getNodeParents`-Walk aufgelöst → echter Sammlungsname statt `PAGE_VARIANT_TEMPLATE_xxx`
 
-**Verwendete API-Endpunkte:**
-
+**JSON-Output (Beispiel):**
+```json
+{
+  "total": 1,
+  "results": [{
+    "title": "Physik",
+    "collectionId": "94f22c9b-…",
+    "topicPageUrl": "https://…/topic-pages?collectionId=…",
+    "educationalContexts": ["Sekundarstufe I", "Sekundarstufe II"],
+    "variants": [
+      {"variantId": "…", "targetGroup": "teacher", "targetGroupLabel": "Lehrkräfte", "topicPageUrl": "…"},
+      {"variantId": "…", "targetGroup": "learner", "targetGroupLabel": "Lernende",  "topicPageUrl": "…"}
+    ]
+  }]
+}
 ```
-# Mode B: Sammlung finden
-POST /search/v1/queries/-home-/mds_oeh/collections?contentType=COLLECTIONS&propertyFilter=-all-
-
-# Mode A+B: Config-Kinder traversieren
-GET /node/v1/nodes/-home-/{configId}/children?filter=folders&propertyFilter=-all-
-GET /node/v1/nodes/-home-/{configNodeId}/children?propertyFilter=-all-
-
-# Mode C: page_variant Suche
-POST /search/v1/queries/-home-/mds_oeh/page_variant?contentType=ALL&propertyFilter=-all-
-Body: { "criteria": [
-  { "property": "ccm:page_variant_is_template", "values": ["false"] },
-  { "property": "ccm:page_variant_profiling_target_group", "values": ["teacher"] }
-] }
-```
-
-**Output-Format:**
-
-```
-Gefundene Themenseiten: 2
-
-## Physik
-Sammlung-nodeId: 94f22c9b-...
-Variante-ID: abc123-...
-Zielgruppe: teacher
-Bildungsstufe: Sekundarstufe I, Sekundarstufe II
-Themenseite: https://redaktion.openeduhub.net/edu-sharing/components/topic-pages?collectionId=94f22c9b-...
-```
-
-**Hinweis Staging vs. Production:** Auf Production sind Themenseiten noch nicht vollständig ausgerollt (`ccm:page_config_ref` fehlt bei den meisten Sammlungen). Auf Staging sind die Varianten konfiguriert. Zum Testen `environment: "staging"` setzen.
 
 ---
 
-## Filter-Parameter
+### 7. `get_subject_portals`
 
-Alle Filter akzeptieren **deutsche Labels** *oder* **vollständige URIs**. Die URI-Auflösung erfolgt lokal über `src/vocabs.ts`.
+Liefert die WLO-Fachportale — die **direkten Sub-Sammlungen unter dem Wurzel-Knoten**.
 
-| Parameter | Beispiel-Labels | Vocabulary-Key |
+| Parameter | Typ | Default | Beschreibung |
+|---|---|---|---|
+| `educationalContext` | string | – | Filter (Default: alle) |
+| `includeContentCounts` | bool | `false` | Zusätzlich `subCollectionCount` pro Portal |
+| `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
+| `environment` | enum | `production` | – |
+
+Output ist deterministisch alphabetisch (Tie-Breaker `nodeId`). Ideal als Einstiegspunkt für geführte Drilldowns.
+
+**API:**
+```
+GET /node/v1/nodes/-home-/{ROOT_ID}/children?filter=folders
+```
+
+---
+
+### 8. `browse_collection_tree`
+
+Drilldown unter eine bestimmte Sammlung — Tiefe 1 (direkte Kinder) oder 2 (Enkel-Knoten).
+
+| Parameter | Typ | Default | Beschreibung |
+|---|---|---|---|
+| `nodeId` | string | **Pflicht** | Eltern-Sammlung |
+| `depth` | int | `1` | `1` oder `2` |
+| `includeContentCounts` | bool | `false` | Pro Sammlung den File-Count mitholen |
+| `maxResults` | int | `50` | 1–100 |
+| `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
+
+> **Achtung Latenz**: `depth=2` + `includeContentCounts=true` macht `O(parents × children + parents)` API-Calls. Bei breiten Bäumen entsprechend lang.
+
+---
+
+### 9. `wlo_health_check`
+
+Probe gegen die WLO-API.
+
+| Parameter | Typ | Default |
 |---|---|---|
-| `educationalContext` | `Primarstufe`, `Sekundarstufe I`, `Hochschule`, `Berufliche Bildung` | `educationalContext` |
-| `discipline` | `Mathematik`, `Biologie`, `Informatik`, `Deutsch`, `MINT` | `discipline` |
-| `userRole` | `Lehrer/in`, `Lerner/in`, `Eltern`, `Berater/in` | `userRole` |
-| `learningResourceType` | `Arbeitsblatt`, `Video`, `Unterrichtsplan`, `Interaktives Medium` | `lrt` |
+| `environment` | enum | `production` |
 
-Alle verfügbaren Werte mit URIs: `lookup_wlo_vocabulary(vocabulary="discipline")` etc.
+**Output (JSON):**
+```json
+{
+  "ok": true,
+  "environment": "production",
+  "baseUrl": "https://redaktion.openeduhub.net/edu-sharing/rest",
+  "rootNodeId": "5e40e372-735c-…",
+  "rootResolved": "Portale",
+  "latencyMs": 392,
+  "checkedAt": "2026-04-27T16:28:04.108Z"
+}
+```
+
+Bei Fehler: `ok: false`, `error: "<message>"`, `isError: true` im MCP-Result. Nützlich für Konsumenten, um "WLO ist down" von "deine Query liefert keine Treffer" zu unterscheiden.
+
+---
+
+### 10. `get_nodes_details`
+
+Bulk-Fetch für mehrere `nodeIds` (max. 50 / Aufruf, parallel).
+
+| Parameter | Typ | Default |
+|---|---|---|
+| `nodeIds` | string[] | **Pflicht** |
+| `environment` | enum | `production` |
+
+**Output:**
+```json
+{
+  "requested": 3,
+  "resolved": 2,
+  "failed": ["00000000-0000-0000-0000-000000000000"],
+  "results": {
+    "bd8be6d5-…": { "title": "Mathematik", "disciplines": ["Mathematik"], … },
+    "742d8c87-…": { "title": "Informatik",  "disciplines": ["Informatik"],  … }
+  }
+}
+```
+
+Einzelne Fehler (gelöschte Node, Netzwerk-Fehler) landen im `failed[]` — der Batch crasht nicht.
+
+---
+
+## Filter-Parameter & Vokabular
+
+Alle Vocab-Filter akzeptieren **deutsche Labels**, **englische Synonyme** *oder* **vollständige URIs**:
+
+| Parameter | Beispielwerte | Vocabulary-Key |
+|---|---|---|
+| `educationalContext` | `Primarstufe`, `Sekundarstufe I`, `Hochschule`, `vocational education` | `educationalContext` |
+| `discipline` | `Mathematik`, `Mathe`, `mathematics`, `Biologie`, `Bio`, `MINT` | `discipline` |
+| `userRole` | `Lehrer/in`, `teacher`, `Lerner/in`, `Eltern`, `parent` | `userRole` |
+| `learningResourceType` | `Arbeitsblatt`, `Video`, `Quiz`, `interactive media` | `lrt` |
+
+### Vocab-Resolution: zwei asymmetrische Pfade
+
+Der Server unterscheidet bewusst zwischen **Anzeige** (URI → Label) und **Filter-Eingabe** (Label → URI):
+
+#### Anzeige-Pfad (URI → Label) — vollständige Abdeckung über `_DISPLAYNAME`
+
+Beim Aufbau eines `FormattedNode` (alle Such-/Detail-Tools) werden Vocab-Felder so resolvt:
+
+1. **Bevorzugt: server-seitiges `<property>_DISPLAYNAME`**, das edu-sharing für jeden indexierten Knoten direkt mitliefert.
+   - Funktioniert für `ccm:taxonid`, `ccm:educationalcontext`, `ccm:oeh_lrt_aggregated`, `ccm:oeh_intended_end_user_role`.
+   - **Deckt automatisch beide Disziplin-Vokabulare ab**: das Schulfächer-Vocab UND die [Hochschulfächersystematik](https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/hochschulfaechersystematik/index.json), ohne dass wir die ~100 Hochschul-Klassen lokal pflegen müssen.
+   - Beispiel: ein Hochschul-Knoten mit `taxonid=[".../hochschulfaechersystematik/n71", ".../n8"]` zeigt `disciplines: ["Studienbereich Informatik", "Ingenieurwissenschaften"]`.
+2. **Fallback: lokales `labelFromUri`-Lookup** (`vocabs.ts`).
+   - Greift, wenn `_DISPLAYNAME` leer ist (z.B. `ccm:commonlicense_key` hat nie ein DISPLAYNAME — daher die lokale License-Map).
+3. **Letzter Fallback: rohe URI** — damit der Konsument zumindest etwas zurückbekommt.
+
+**Rauschfilter:** Vokabular-Root-URIs (z.B. nur `.../discipline/` ohne konkretes Fach-Slug) werden ausgefiltert — sonst würde DISPLAYNAME den **Vokabular-Titel** ("Schulfächer", "Destatis-Systematik der Fächergruppen, Studienbereiche und Studienfächer") als Disziplin anzeigen.
+
+#### Filter-Eingabe-Pfad (Label → URI) — bewusst konservativ
+
+`resolveVocab` (`vocabs.ts`) deckt **nur die Schulfächer-Liste** ab. Begründung:
+
+- Das Hochschul-Vocab und das Schul-Vocab teilen sich Labels: `"Mathematik"` existiert in beiden, mit unterschiedlicher Semantik (Schul-Mathematik = `discipline/380`; Hochschul-`n4` = "Mathematik, **Naturwissenschaften**" — viel breiter).
+- Wer User-Input automatisch auch ins Hochschul-Vocab mappt, riskiert ungewollte Filter (z.B. wird auch Physik/Chemie/Bio mit-gefiltert).
+- Mehrheit der WLO-Inhalte ist schulisch.
+- Wer gezielt Hochschul-Inhalte will, kann orthogonal über `educationalContext: "Hochschule"` filtern.
+
+**Resolver-Schritte** für Label-Eingabe:
+1. URI? → durchreichen
+2. Direkt-Match auf Label / Alias (case-insensitive)
+3. Substring-Match (Label im Input ODER Input im Label) — fängt Tippfehler/Paraphrasen wie `"Naturwiss"` (matcht `"naturwissenschaften"`)
+4. Kein Match → null (Caller kann den Wert trotzdem an die WLO-API durchgeben)
+
+**Empfehlung für Konsumenten** (LLM-gestützte Apps):
+Bei freier Nutzereingabe (`"sciences"`, `"Mathe Klasse 11 Gym"`) zuerst per LLM auf einen `lookup_wlo_vocabulary`-Eintrag mappen, dann den canonical Label / URI an die Such-Tools übergeben. So fängst du Paraphrasen ab, die Substring-Matching nicht mehr trifft.
+
+Alle Werte mit URIs: `lookup_wlo_vocabulary({ vocabulary: "discipline" })`.
+
+### Offizielle Vocab-Quellen
+
+Wer das lokale Vocab in `src/vocabs.ts` aktualisieren oder Aliases ergänzen will:
+
+| Vocab | URL |
+|---|---|
+| Schulfächer (`discipline`) | https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/discipline/index.json |
+| Bildungsstufe (`educationalContext`) | https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/educationalContext/index.json |
+| Zielgruppe (`userRole` / `intendedEndUserRole`) | https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/intendedEndUserRole/index.json |
+| Lernressourcentypen (aggregiert) (`lrt`) | https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/new_lrt_aggregated/index.json |
+| **Hochschulfächersystematik** (NICHT lokal gepflegt) | https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/hochschulfaechersystematik/index.json |
+
+Anzeige-Resolution für Hochschul-URIs erfolgt automatisch über `_DISPLAYNAME` aus dem edu-sharing-Index — ein lokales Hochschul-Vocab ist daher nicht nötig.
+
+---
+
+## Output-Formate (markdown vs. json)
+
+Alle Tools mit Suchergebnissen unterstützen `outputFormat`:
+
+### `outputFormat: "markdown"` (Default)
+
+Menschenlesbare Karten, gut für Chat-Bots, die das LLM die Cards selbst rendern lassen. Beispiel:
+```
+## Bruchrechnung Einführung
+nodeId: dc6b3f33-…
+Beschreibung: …
+Fach: Mathematik
+Bildungsstufe: Sekundarstufe i
+Lizenz: CC BY-SA 4.0
+URL: https://…
+Vorschaubild: https://…
+Themenseite: https://…
+Typ: Inhalt
+```
+
+### `outputFormat: "json"`
+
+Strukturierter JSON-String, optimal für Konsumenten, die Daten programmatisch weiterverarbeiten:
+```json
+{
+  "total": 287,
+  "count": 5,
+  "results": [
+    {
+      "nodeId": "dc6b3f33-…",
+      "title": "Bruchrechnung Einführung",
+      "description": "…",
+      "keywords": ["Bruch", "Mathematik"],
+      "disciplines": ["Mathematik"],
+      "educationalContexts": ["Sekundarstufe i"],
+      "userRoles": [],
+      "learningResourceTypes": ["Video"],
+      "license": "CC BY-SA 4.0",
+      "publisher": "Mathe by Daniel Jung",
+      "url": "https://…",
+      "previewUrl": "https://…",
+      "topicPageUrl": "",
+      "nodeType": "content"
+    }
+  ]
+}
+```
+
+> **Wichtig**: `disciplines`, `educationalContexts`, `userRoles`, `learningResourceTypes`, `license` sind **immer Labels**, nie URIs. Konsumenten können `card.disciplines[0]` direkt anzeigen.
+
+---
+
+## Determinismus & Stabilität
+
+**Was du erwarten kannst:**
+- Bei **identischer Input + identischem WLO-Server-Pool** liefern alle Tools deterministische Reihenfolge:
+  - Tie-Breaker `nodeId.localeCompare()` in allen Rankings
+  - `sortByTitle()` mit Tie-Breaker für alphabetische Sortierungen
+  - `get_subject_portals`, `browse_collection_tree`, `search_wlo_topic_pages` (sort=alpha) sind vollständig deterministisch.
+- **Mode C** von `search_wlo_topic_pages` ist deterministisch (alphabetisch über Sammlungsnamen).
+
+**Was außerhalb unserer Kontrolle liegt:**
+- Die **WLO-API** kann bei sehr ähnlichen Score-Treffern in seltenen Fällen einen anderen Pool liefern (Solr-Cache-Reshuffles serverseitig). Das beeinflusst `search_wlo_content` / Mode B von `search_wlo_topic_pages`. Mit `sort: "alpha"` umgehst du das.
 
 ---
 
 ## Deployment
 
-### Option A: Vercel (empfohlen für öffentliche API)
+### Option A: Vercel (empfohlen)
 
-> **Hinweis Vercel-Plan:** Die Web-Tools (`get_*_info`) rufen einen externen Browser-Rendering-Dienst auf, der bis zu 20–30 Sekunden dauern kann. Die `vercel.json` setzt `maxDuration: 30`. Vercel **Hobby** erlaubt maximal 10 Sekunden – für die Web-Tools ist daher mindestens **Vercel Pro** erforderlich. Alle anderen Tools (Suche, Collections, Node-Details, Vokabular) laufen problemlos auf Hobby.
+> Da die Web-Crawler-Tools entfernt sind, läuft v2 ohne Einschränkung auf **Vercel Hobby** (`maxDuration: 10s` reicht). Die `vercel.json` setzt trotzdem `maxDuration: 30` als Sicherheitspolster für `browse_collection_tree(depth=2, includeContentCounts=true)` bei breiten Bäumen.
 
-1. Repository auf GitHub pushen
-2. Vercel → **New Project** → Repository importieren
-3. **Environment Variable** setzen (kann im Dashboard überschrieben werden):
-
-   | Name | Wert |
-   |---|---|
-   | `WLO_ENV` | `production` oder `staging` |
-
+1. Repo auf GitHub pushen
+2. Vercel → New Project → Repo importieren
+3. Environment Variable: `WLO_ENV=production`
 4. Deploy → MCP-Endpoint: `https://dein-projekt.vercel.app/mcp`
 
-### Option B: Docker (selbst gehostet, HTTP-Modus)
+### Option B: Docker
 
 ```bash
-# Build
 docker build -t wlomcp .
-
-# Starten (Production, Port 3000)
 docker run -p 3000:3000 -e WLO_ENV=production wlomcp
-
-# Staging-Umgebung
-docker run -p 3000:3000 -e WLO_ENV=staging wlomcp
+# → http://localhost:3000/mcp
 ```
 
-MCP-Endpoint: `http://localhost:3000/mcp`
-
-### Option C: Docker (stdio-Modus, für lokale AI-Clients)
+### Option C: Lokal
 
 ```bash
-docker run -i --rm -e WLO_ENV=production wlomcp node dist/stdio.js
-```
-
-### Option D: Lokal (Entwicklung)
-
-```bash
-cd wlomcp
 npm install
 npm run build
-
-# HTTP-Server auf Port 3000
 node dist/http.js
-
-# Oder mit Auto-Reload
-npm run dev:http
+# → http://localhost:3000/mcp
 ```
 
 ---
@@ -431,7 +533,7 @@ npm run dev:http
 
 ```python
 response = client.responses.create(
-    model="gpt-4o",
+    model="gpt-5",
     tools=[{
         "type": "mcp",
         "server_label": "wlo",
@@ -448,17 +550,16 @@ response = client.responses.create(
 import anthropic
 client = anthropic.Anthropic()
 
-server = {"type": "url", "url": "https://dein-projekt.vercel.app/mcp", "name": "wlo"}
 response = client.beta.messages.create(
     model="claude-opus-4-5",
     max_tokens=4096,
-    mcp_servers=[server],
-    messages=[{"role": "user", "content": "Suche WLO-Sammlungen zum Thema Klimawandel für die Sekundarstufe I"}],
+    mcp_servers=[{"type": "url", "url": "https://dein-projekt.vercel.app/mcp", "name": "wlo"}],
+    messages=[{"role": "user", "content": "Suche WLO-Sammlungen zum Thema Klimawandel"}],
     betas=["mcp-client-2025-04-04"],
 )
 ```
 
-### Claude Desktop (`claude_desktop_config.json`)
+### Claude Desktop
 
 ```json
 {
@@ -479,37 +580,41 @@ response = client.beta.messages.create(
 ```
 wlomcp/
 ├── src/
-│   ├── server.ts       # MCP Server + alle 10 Tool-Definitionen (transport-agnostisch)
-│   ├── vocabs.ts       # Label ↔ URI Mappings (Bildungsstufe, Fach, Zielgruppe, LRT)
-│   ├── wlo-api.ts      # WLO/EduSharing API Client + Web Content Extraction + Whitelist
-│   ├── reranker.ts     # Multi-Query-Expansion + RRF + Relevance Scoring
-│   ├── formatter.ts    # WLO-Node → strukturierter Markdown-Output (mit Typ: Sammlung/Inhalt)
-│   ├── stdio.ts        # Entry: stdio Transport
-│   └── http.ts         # Entry: Streamable HTTP Transport
+│   ├── server.ts       # 10 Tool-Definitionen (transport-agnostisch)
+│   ├── vocabs.ts       # Label ↔ URI Mappings (educationalContext, discipline,
+│   │                   #   userRole, lrt, license, targetGroup)
+│   ├── wlo-api.ts      # WLO/EduSharing-API-Client + resolveVariantCollection
+│   ├── reranker.ts     # Multi-Query-Expansion + RRF + Quality-Score (pure JS)
+│   ├── formatter.ts    # WloNode → FormattedNode → Markdown / JSON
+│   ├── stdio.ts        # Entry: stdio-Transport
+│   └── http.ts         # Entry: Streamable HTTP
 ├── api/
-│   └── mcp.ts          # Vercel Serverless Function
-├── vercel.json         # Vercel Konfiguration (maxDuration: 30s für Web-Tools)
-├── Dockerfile          # Docker Build
-└── .env.example        # Umgebungsvariablen
+│   └── mcp.ts          # Vercel-Serverless-Function-Wrapper
+├── vercel.json         # Vercel-Config
+├── Dockerfile
+└── .env.example
 ```
 
-**Output-Format (`formatter.ts`):**
+**`FormattedNode`-Schema** (das gemeinsame Output-Format aller Tools):
 
-Jeder Node wird als Markdown-Block ausgegeben:
+```ts
+{
+  nodeId: string;
+  title: string;
+  description: string;
+  keywords: string[];
+  disciplines: string[];           // Labels: ["Mathematik"]
+  educationalContexts: string[];   // Labels: ["Sekundarstufe i"]
+  userRoles: string[];             // Labels: ["Lehrer/in"]
+  learningResourceTypes: string[]; // Labels: ["Arbeitsblatt"]
+  url: string;
+  previewUrl: string;
+  license: string;                 // Label: "CC BY-SA 4.0"
+  publisher: string;
+  nodeType: 'collection' | 'content';
+  topicPageUrl: string;            // wenn ccm:page_config_ref vorhanden
+}
 ```
-## Titel
-nodeId: <uuid>
-Beschreibung: ...
-Fach: Mathematik
-Bildungsstufe: Sekundarstufe I
-URL: https://...
-Vorschaubild: https://...
-Themenseite: https://...   ← nur wenn ccm:page_config_ref vorhanden
-Typ: Sammlung   ← oder: Typ: Inhalt
-```
-
-`Typ: Sammlung` = Collection-Node (`isDirectory=true`), `Typ: Inhalt` = Datei/Material.
-`Themenseite:` = Kuratierte Themenseiten-URL, nur bei Sammlungen mit `ccm:page_config_ref`.
 
 **API-Basis-URLs:**
 
@@ -520,9 +625,34 @@ Typ: Sammlung   ← oder: Typ: Inhalt
 
 ---
 
+## Migration v1 → v2
+
+### Wenn du heute v1 nutzt
+
+| v1-Verhalten | v2-Verhalten |
+|---|---|
+| `get_node_details` liefert `Fach-URI: http://w3id.org/.../380` | `get_node_details` liefert `Fach: Mathematik` (Label). Mit `includeRaw: true` zusätzlich URI |
+| `Lizenz: CC_BY_SA` (Roh-Key) | `Lizenz: CC BY-SA 4.0` (Display-Form) |
+| `## PAGE_VARIANT_TEMPLATE_xxx` als Themenseiten-Titel im Mode C | `## Mathematik` (Sammlungsname) — Owner wird via API resolvt |
+| `Zielgruppe: teacher` (Slug) | `Zielgruppe: Lehrkräfte` (Label) |
+| Mehrere Varianten = N separate Karten | 1 Karte mit `variants[]`-Array (oder `mergeVariants: false` für altes Verhalten) |
+| Gleicher Score → unspezifizierte Reihenfolge | Tie-Breaker `nodeId.localeCompare()` → deterministisch |
+| `get_*_info`-Tools (4 Stück) | **Entfernt**. Konsument soll RAG/eigene Page-Extraction nutzen |
+
+### Empfohlene Migration
+
+1. **Sofort ausführen**: `wlo_health_check` einmalig nach Deploy, Latenz prüfen, Server-Status verifizieren
+2. **JSON-Output progressiv aktivieren**: Beginne mit `get_node_details` und `search_wlo_topic_pages` — die hatten in v1 die meisten Inkonsistenzen. Vorher: Markdown-Parsing → Nachher: `JSON.parse()`
+3. **Webseiten-Tool-Aufrufe entfernen**: Wenn dein Client `get_wirlernenonline_info` etc. nutzt → entweder ein eigenes RAG aufsetzen oder das Tool aus dem Allowlist deines AI-Clients nehmen
+4. **Variant-Merge-Code entfernen**: Wenn dein Client mehrere Varianten desselben Themas selbst gemerged hat → das macht der Server jetzt
+5. **Discipline-URI-Resolver in Konsumenten**: Wer früher Karten-Disciplines manuell auf Labels resolvte, kann diese Logik abklemmen — Server liefert immer Labels
+
+---
+
 ## Kompatibilität
 
-- **Tool-Namen** verwenden ausschließlich Kleinbuchstaben und Unterstriche — kompatibel mit OpenAI und Anthropic
-- **Input-Schemas** sind JSON Schema (via Zod) — Standard-konform
+- **Tool-Namen** sind ausschließlich Kleinbuchstaben + Unterstriche → kompatibel mit OpenAI / Anthropic
+- **Input-Schemas** sind JSON Schema (via Zod) → Standard-konform
 - **Transport**: Streamable HTTP (MCP spec 2025-03-26) für Vercel/Docker; stdio für lokale Clients
 - **Stateless**: Kein Session-State → skaliert auf Vercel Serverless
+- **Vercel-tauglich**: Reranker ist pure JS, kein Transformer-Modell, kein Speicherbedarf > Function-Limit

@@ -11,7 +11,7 @@ export const WLO_ROOT_COLLECTION_IDS: Record<WloEnvironment, string> = {
   staging:    '5e40e372-735c-4b17-bbf7-e827a5702b57',
 };
 
-const BASE_URLS: Record<WloEnvironment, string> = {
+export const BASE_URLS: Record<WloEnvironment, string> = {
   production: 'https://redaktion.openeduhub.net/edu-sharing/rest',
   staging:    'https://repository.staging.openeduhub.net/edu-sharing/rest',
 };
@@ -335,6 +335,57 @@ export async function searchPageVariants(
 }
 
 /**
+ * Resolve a page-variant node back to its owning collection by walking
+ * parent → page_config → collection. Returns { id, name } or null.
+ *
+ * This is needed for Mode C of search_wlo_topic_pages where we list all
+ * variants but don't yet know which collection each belongs to.
+ */
+export async function resolveVariantCollection(
+  env: WloEnvironment,
+  variantId: string,
+): Promise<{ id: string; name: string } | null> {
+  // 1) variant → its parent (page_config_node)
+  const parentRes = await fetch(
+    `${base(env)}/node/v1/nodes/-home-/${variantId}/parents?propertyFilter=-all-`,
+    { headers: { Accept: 'application/json' } },
+  );
+  if (!parentRes.ok) return null;
+  const parentData = await parentRes.json() as { nodes?: WloNode[]; parents?: WloNode[] };
+  const parents = parentData.nodes ?? parentData.parents ?? [];
+  if (parents.length === 0) return null;
+
+  // 2) Walk up to find a node whose nodeId matches a collection's
+  //    `ccm:page_config_ref` value. We do this by going up one more level:
+  //    the page_config_node's parent is itself a config-folder; the
+  //    config-folder's id is what `ccm:page_config_ref` points to.
+  // Cheaper: take the page_config_node's parent's parent — it's the
+  // collection.
+  for (const p of parents) {
+    const pid = p.ref?.id;
+    if (!pid) continue;
+    // Walk one more level up
+    const grandRes = await fetch(
+      `${base(env)}/node/v1/nodes/-home-/${pid}/parents?propertyFilter=-all-`,
+      { headers: { Accept: 'application/json' } },
+    );
+    if (!grandRes.ok) continue;
+    const grandData = await grandRes.json() as { nodes?: WloNode[]; parents?: WloNode[] };
+    const grand = (grandData.nodes ?? grandData.parents ?? []);
+    for (const g of grand) {
+      const gprops = g.properties ?? {};
+      // The collection node has page_config_ref AND is_template/folder-y
+      if (gprops['ccm:page_config_ref']?.length) {
+        const name = gprops['cclom:title']?.[0] ?? gprops['cm:name']?.[0] ?? g.name ?? '';
+        const id = g.ref?.id ?? '';
+        if (id) return { id, name };
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Given a collection nodeId, check if it has ccm:page_config_ref and resolve
  * the theme page variants underneath it.
  * Returns an array of ThemePageInfo with variant details.
@@ -391,70 +442,3 @@ export async function getCollectionThemePages(
   return results;
 }
 
-// ── Web content extraction ────────────────────────────────────────────────────
-
-const TEXT_EXTRACTION_URL = 'https://text-extraction.staging.openeduhub.net/from-url';
-
-/** Whitelisted origins whose pages may be fetched. Subpages are always allowed. */
-export const WEB_CONTENT_WHITELIST: string[] = [
-  'https://www.wirlernenonline.de',
-  'https://edu-sharing-network.org',
-  'https://edu-sharing.com',
-  'https://metaventis.com',
-];
-
-/**
- * Check whether a URL belongs to one of the whitelisted origins.
- * Subpaths and trailing-slash variants are accepted.
- */
-export function isAllowedUrl(url: string): boolean {
-  try {
-    const target = new URL(url);
-    return WEB_CONTENT_WHITELIST.some(allowed => {
-      const origin = new URL(allowed);
-      return (
-        target.hostname === origin.hostname ||
-        target.hostname.endsWith('.' + origin.hostname)
-      );
-    });
-  } catch {
-    return false;
-  }
-}
-
-/**
- * POST https://text-extraction.staging.openeduhub.net/from-url
- * Extracts the text content of a webpage and returns it as Markdown.
- * Only whitelisted URLs are accepted.
- */
-export async function fetchWebContent(url: string): Promise<string> {
-  if (!isAllowedUrl(url)) {
-    throw new Error(
-      `URL nicht erlaubt. Nur Seiten der folgenden Domains sind zulässig: ${WEB_CONTENT_WHITELIST.join(', ')}`
-    );
-  }
-
-  const body = JSON.stringify({
-    url,
-    method: 'browser',
-    browser_location: null,
-    lang: 'auto',
-    output_format: 'markdown',
-    preference: 'none',
-  });
-
-  const res = await fetch(TEXT_EXTRACTION_URL, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body,
-  });
-
-  if (!res.ok) {
-    throw new Error(`Text-Extraktion fehlgeschlagen: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json() as Record<string, unknown>;
-  // The service may return the content under different keys
-  const content = (data['content'] ?? data['text'] ?? data['markdown'] ?? data['result'] ?? '') as string;
-  return content;
-}

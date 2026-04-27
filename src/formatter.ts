@@ -27,8 +27,56 @@ function first(arr: string[] | undefined): string {
   return arr?.[0] ?? '';
 }
 
-function resolveLabels(uris: string[] | undefined, vocab: Parameters<typeof labelFromUri>[1]): string[] {
-  return (uris ?? []).map(u => labelFromUri(u, vocab));
+/**
+ * Resolve a vocab-backed property to display labels.
+ *
+ * **Priority order (deliberate):**
+ *
+ * 1. **`<property>_DISPLAYNAME`** — server-side resolved labels straight
+ *    from the edu-sharing index. This is the *only* source that covers
+ *    BOTH the school discipline vocab AND the Hochschulfächersystematik
+ *    (and any future vocab) without us maintaining hundreds of mappings
+ *    locally. Verified to be present for `ccm:taxonid`,
+ *    `ccm:educationalcontext`, `ccm:oeh_lrt_aggregated`.
+ *
+ * 2. **Local `labelFromUri` lookup** — fallback for legacy data and
+ *    properties where `_DISPLAYNAME` isn't populated (e.g.
+ *    `ccm:commonlicense_key` — license keys are stored as raw strings
+ *    like `CC_BY_SA` and have no server-side display name).
+ *
+ * 3. **Raw URI** — final fallback inside `labelFromUri` so the consumer
+ *    sees something rather than nothing.
+ *
+ * Why we do NOT use `_DISPLAYNAME` for label-→-URI resolution
+ * (`resolveVocab`): user inputs like "Mathematik" are ambiguous between
+ * the school vocab (`discipline/380` = Mathematik) and Hochschul-`n4`
+ * ("Mathematik, Naturwissenschaften" — broader than expected).
+ * Mapping inputs is therefore kept conservative on the school vocab,
+ * while displaying labels uses DISPLAYNAME for full coverage.
+ */
+function resolveLabels(
+  uris: string[] | undefined,
+  displayNames: string[] | undefined,
+  vocab: Parameters<typeof labelFromUri>[1],
+): string[] {
+  if (displayNames && displayNames.length > 0) {
+    // Pair URIs with DISPLAYNAMEs and drop entries where the URI is a
+    // vocabulary-root (e.g. ".../discipline/") — the index resolves those
+    // to the vocabulary title ("Schulfächer") which is meaningless for UI.
+    const cleaned: string[] = [];
+    for (let i = 0; i < displayNames.length; i++) {
+      const name = displayNames[i];
+      if (typeof name !== 'string' || name.trim() === '') continue;
+      const uri = uris?.[i] ?? '';
+      if (uri && /\/$/.test(uri)) continue;  // ".../discipline/" root URI
+      cleaned.push(name);
+    }
+    if (cleaned.length > 0) return cleaned;
+  }
+  if (!uris) return [];
+  return uris
+    .filter(u => !u || !/\/$/.test(u))    // also skip root URIs in fallback
+    .map(u => labelFromUri(u, vocab));
 }
 
 let _formatEnv: WloEnvironment = 'production';
@@ -44,13 +92,14 @@ export function formatNode(node: WloNode): FormattedNode {
     title:                first(p['cclom:title']) || first(p['cm:name']) || node.name || node.title || '',
     description:          first(p['cclom:general_description']) || node.collection?.description || '',
     keywords:             p['cclom:general_keyword'] ?? [],
-    disciplines:          resolveLabels(p['ccm:taxonid'], 'discipline'),
-    educationalContexts:  resolveLabels(p['ccm:educationalcontext'], 'educationalContext'),
-    userRoles:            resolveLabels(p['ccm:oeh_intended_end_user_role'], 'userRole'),
-    learningResourceTypes:resolveLabels(p['ccm:oeh_lrt_aggregated'], 'lrt'),
+    disciplines:          resolveLabels(p['ccm:taxonid'],                    p['ccm:taxonid_DISPLAYNAME'],                    'discipline'),
+    educationalContexts:  resolveLabels(p['ccm:educationalcontext'],         p['ccm:educationalcontext_DISPLAYNAME'],         'educationalContext'),
+    userRoles:            resolveLabels(p['ccm:oeh_intended_end_user_role'], p['ccm:oeh_intended_end_user_role_DISPLAYNAME'], 'userRole'),
+    learningResourceTypes:resolveLabels(p['ccm:oeh_lrt_aggregated'],         p['ccm:oeh_lrt_aggregated_DISPLAYNAME'],         'lrt'),
     url:                  first(p['ccm:wwwurl']) || node.content?.url || '',
     previewUrl:           node.preview?.url ?? '',
-    license:              first(p['ccm:commonlicense_key']) || '',
+    // Licenses don't have a server-side _DISPLAYNAME — keep local map.
+    license:              labelFromUri(first(p['ccm:commonlicense_key']), 'license') || '',
     publisher:            first(p['ccm:oeh_publisher_combined']) || '',
     nodeType:             node.isDirectory === true ? 'collection' : 'content',
     topicPageUrl:         buildTopicPageUrl(_formatEnv, nodeId, pageConfigRef) ?? '',
@@ -61,7 +110,19 @@ export function formatNodes(nodes: WloNode[]): FormattedNode[] {
   return nodes.map(formatNode);
 }
 
-/** Render a list of FormattedNodes as a compact JSON string for LLM consumption. */
+/**
+ * Render a structured JSON envelope. Use when the caller wants to parse fields
+ * directly instead of regex-matching the markdown output.
+ */
+export function renderToJson(nodes: FormattedNode[], totalHits?: number): string {
+  return JSON.stringify({
+    total: totalHits ?? nodes.length,
+    count: nodes.length,
+    results: nodes,
+  }, null, 2);
+}
+
+/** Render a list of FormattedNodes as a compact text format for LLM consumption. */
 export function renderToText(nodes: FormattedNode[], totalHits?: number): string {
   const lines: string[] = [];
   if (totalHits !== undefined) {

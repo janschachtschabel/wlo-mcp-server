@@ -1,10 +1,37 @@
 /**
  * vocabs.ts – WLO Vocabulary mappings
+ *
  * Resolves human-readable labels (German) ↔ full URIs for
- * Bildungsstufe, Zielgruppe, Schulfach, Lernressourcentyp (aggregiert).
+ * Bildungsstufe, Zielgruppe, Schulfach, Lernressourcentyp (aggregiert),
+ * Lizenzen und Themenseiten-Zielgruppen.
+ *
+ * **Authoritative sources (offizielle SKOS-Vokabulare):**
+ *   - Schulfächer (this file's `discipline` map):
+ *     https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/discipline/index.json
+ *   - Bildungsstufen:
+ *     https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/educationalContext/index.json
+ *   - Zielgruppen (intendedEndUserRole):
+ *     https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/intendedEndUserRole/index.json
+ *   - Lernressourcentypen (aggregiert):
+ *     https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/new_lrt_aggregated/index.json
+ *
+ * **Bewusst NICHT enthalten:** Hochschulfächersystematik
+ *     https://vocabs.openeduhub.de/w3id.org/openeduhub/vocabs/hochschulfaechersystematik/index.json
+ *
+ * Begründung: Das Vokabular hat ~100+ Konzepte mit Top-Level-Bereichen
+ * wie "Mathematik, Naturwissenschaften" (n4) — Begriffe kollidieren mit
+ * dem Schulfächer-Vokabular (z.B. "Mathematik" → discipline/380 vs.
+ * Hochschul-n4 = breiter Cluster). Lokale Resolution wäre für die
+ * *Eingabe-Seite* (User-Filter) ambig und könnte ungewollt zu breit
+ * filtern.
+ *
+ * Anzeige (URI → Label) wird stattdessen über das server-seitige
+ * `<property>_DISPLAYNAME`-Feld der edu-sharing-API in `formatter.ts`
+ * abgewickelt — das deckt beide Vokabulare automatisch ab, ohne lokale
+ * Hochschul-Mappings zu pflegen.
  */
 
-export type VocabKey = 'educationalContext' | 'discipline' | 'userRole' | 'lrt';
+export type VocabKey = 'educationalContext' | 'discipline' | 'userRole' | 'lrt' | 'license' | 'targetGroup';
 
 interface VocabEntry {
   id: string;     // full URI
@@ -164,6 +191,39 @@ const LRT: VocabEntry[] = [
   { id: LRT_BASE + '2e678af3-1026-4171-b88e-3b3a915d1673', labels: ['quelle', 'source'] },
 ];
 
+// ── Lizenzen ─────────────────────────────────────────────────────────────────
+// edu-sharing stores license keys (ccm:commonlicense_key) like "CC_BY_SA".
+// We map them to human-readable labels here for consistent output.
+
+// NOTE: For licenses we store the *display form* as the primary label
+// (e.g. "CC BY-SA 4.0" instead of "cc by-sa 4.0"). Capitalize-logic in
+// labelFromUri only kicks in for fully-lowercase primary labels — otherwise
+// "cc by-sa 4.0" would render as the unhelpful "Cc by-sa 4.0".
+const LICENSE: VocabEntry[] = [
+  { id: 'CC_0',         labels: ['CC 0', 'cc0', 'public domain dedication'] },
+  { id: 'PDM',          labels: ['Public Domain Mark', 'gemeinfrei'] },
+  { id: 'CC_BY',        labels: ['CC BY 4.0', 'creative commons by'] },
+  { id: 'CC_BY_SA',     labels: ['CC BY-SA 4.0', 'creative commons by-sa'] },
+  { id: 'CC_BY_ND',     labels: ['CC BY-ND 4.0', 'creative commons by-nd'] },
+  { id: 'CC_BY_NC',     labels: ['CC BY-NC 4.0', 'creative commons by-nc'] },
+  { id: 'CC_BY_NC_SA',  labels: ['CC BY-NC-SA 4.0', 'creative commons by-nc-sa'] },
+  { id: 'CC_BY_NC_ND',  labels: ['CC BY-NC-ND 4.0', 'creative commons by-nc-nd'] },
+  { id: 'COPYRIGHT_FREE', labels: ['urheberrechtsfrei', 'copyright free'] },
+  { id: 'CUSTOM',       labels: ['Individuelle Lizenz', 'custom'] },
+  { id: 'NONE',         labels: ['Keine Angabe', 'no license info'] },
+  { id: 'SCHULFUNK',    labels: ['Schulfunk §47 UrhG', 'schulfunk'] },
+];
+
+// ── Themenseiten-Zielgruppe ──────────────────────────────────────────────────
+// `ccm:page_variant_profiling_target_group` is sometimes a slug,
+// sometimes a URI. Map both to readable German labels.
+
+const TARGET_GROUP: VocabEntry[] = [
+  { id: 'teacher',  labels: ['lehrkräfte', 'lehrkraefte', 'lehrer', 'lehrerinnen', 'teacher'] },
+  { id: 'learner',  labels: ['lernende', 'schüler', 'schueler', 'schülerinnen', 'learner', 'students'] },
+  { id: 'general',  labels: ['allgemein', 'general', 'public'] },
+];
+
 // ── Generic resolver ─────────────────────────────────────────────────────────
 
 const VOCAB_MAP: Record<VocabKey, VocabEntry[]> = {
@@ -171,6 +231,8 @@ const VOCAB_MAP: Record<VocabKey, VocabEntry[]> = {
   discipline: DISCIPLINE,
   userRole: USER_ROLE,
   lrt: LRT,
+  license: LICENSE,
+  targetGroup: TARGET_GROUP,
 };
 
 /** Resolve a label or URI to a full URI. Returns null if nothing matches. */
@@ -184,20 +246,56 @@ export function resolveVocab(input: string, vocab: VocabKey): string | null {
   const lower = trimmed.toLowerCase();
   const entries = VOCAB_MAP[vocab];
   for (const entry of entries) {
-    if (entry.labels.some(l => l === lower || l.includes(lower) || lower.includes(l))) {
+    if (entry.labels.some(l => {
+      const ll = l.toLowerCase();
+      return ll === lower || ll.includes(lower) || lower.includes(ll);
+    })) {
       return entry.id;
     }
   }
   return null;
 }
 
-/** Get German label for a URI, or the URI itself as fallback. */
+/** Extract the trailing slug from a URI: ".../teacher" → "teacher" */
+function trailingSlug(uri: string): string {
+  if (!uri) return '';
+  const cleaned = uri.split(/[#?]/, 1)[0]!.replace(/\/+$/, '');
+  const idx = Math.max(cleaned.lastIndexOf('/'), cleaned.lastIndexOf(':'));
+  return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
+}
+
+/** Get German label for a URI/key, or the original input as fallback. */
 export function labelFromUri(uri: string, vocab: VocabKey): string {
+  if (!uri) return uri;
   const entries = VOCAB_MAP[vocab];
-  const entry = entries.find(e => e.id === uri);
+
+  // Direct match (full URI or simple key)
+  let entry = entries.find(e => e.id === uri);
+
+  // Trailing-slug match for namespaced values like "ccrep://.../teacher"
+  if (!entry) {
+    const slug = trailingSlug(uri).toLowerCase();
+    if (slug) {
+      entry = entries.find(e => {
+        const eSlug = trailingSlug(e.id).toLowerCase();
+        return eSlug === slug;
+      });
+    }
+  }
+
+  // Label/alias match (case-insensitive) for inputs that are already labels
+  if (!entry) {
+    const lower = uri.toLowerCase();
+    entry = entries.find(e => e.labels.some(l => l.toLowerCase() === lower));
+  }
+
   if (!entry) return uri;
-  // Capitalize first letter of first label
   const first = entry.labels[0];
+  // If the primary label has any uppercase already (e.g. "CC BY-SA 4.0"),
+  // assume the vocab author chose the display form deliberately — don't
+  // mangle it. Otherwise capitalize the first character so plain-lowercase
+  // labels like "mathematik" become "Mathematik".
+  if (/[A-ZÄÖÜ]/.test(first)) return first;
   return first.charAt(0).toUpperCase() + first.slice(1);
 }
 

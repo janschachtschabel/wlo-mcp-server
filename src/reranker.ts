@@ -214,7 +214,15 @@ function mergeAndRank(
     e.finalScore = normQuality * 0.8 + normRrf * 0.1 + bonus;
   }
 
-  entries.sort((a, b) => b.finalScore - a.finalScore);
+  // Deterministic tie-breaker: when scores are equal, sort by nodeId
+  // (lexicographically). Otherwise the order depends on the JS engine's
+  // sort stability + insertion order from the parallel `Promise.allSettled`
+  // — which can flip between calls and gives the impression of "random"
+  // results.
+  entries.sort((a, b) => {
+    if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+    return a.nodeId.localeCompare(b.nodeId);
+  });
 
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
   const minScore   = Math.max(5, queryTerms.length * 3);
@@ -262,7 +270,20 @@ export function rerankNodes(nodes: WloNode[], query: string): WloNode[] {
   if (!query.trim() || nodes.length === 0) return nodes;
   return nodes
     .filter(n => !isDeletedNode(n))
-    .map(n => ({ node: n, score: computeRelevanceScore(n, query) }))
-    .sort((a, b) => b.score - a.score)
+    .map(n => ({ node: n, score: computeRelevanceScore(n, query), id: getNodeId(n) }))
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.id.localeCompare(b.id);
+    })
     .map(s => s.node);
+}
+
+/** Deterministic alphabetical sort by title (with nodeId tie-breaker). */
+export function sortByTitle(nodes: WloNode[]): WloNode[] {
+  return [...nodes].sort((a, b) => {
+    const ta = (a.properties?.['cclom:title']?.[0] ?? a.properties?.['cm:name']?.[0] ?? a.name ?? '').toLowerCase();
+    const tb = (b.properties?.['cclom:title']?.[0] ?? b.properties?.['cm:name']?.[0] ?? b.name ?? '').toLowerCase();
+    if (ta !== tb) return ta.localeCompare(tb, 'de');
+    return getNodeId(a).localeCompare(getNodeId(b));
+  });
 }

@@ -7,10 +7,11 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type { WloEnvironment, SearchCriterion } from './wlo-api.js';
-import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, fetchWebContent, WEB_CONTENT_WHITELIST, WLO_ROOT_COLLECTION_IDS, searchPageVariants, getCollectionThemePages, buildTopicPageUrl } from './wlo-api.js';
-import type { TargetGroup, ThemePageInfo } from './wlo-api.js';
-import { enhancedSearch, rerankNodes } from './reranker.js';
-import { formatNodes, renderToText, setFormatEnvironment } from './formatter.js';
+import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getCollectionMetadata, getNodeTextContent, getNodeParents, WLO_ROOT_COLLECTION_IDS, searchPageVariants, getCollectionThemePages, buildTopicPageUrl, BASE_URLS, resolveVariantCollection } from './wlo-api.js';
+import type { TargetGroup, ThemePageInfo, WloNode } from './wlo-api.js';
+import { enhancedSearch, rerankNodes, sortByTitle } from './reranker.js';
+import { formatNodes, formatNode, renderToText, renderToJson, setFormatEnvironment } from './formatter.js';
+import type { FormattedNode } from './formatter.js';
 import { resolveVocab, listVocab, labelFromUri, type VocabKey } from './vocabs.js';
 
 // ── Shared filter builder ────────────────────────────────────────────────────
@@ -82,6 +83,12 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
       maxResults: z.number().int().min(1).max(20).optional().default(5).describe(
         'Maximum number of results (1–20, default 5)'
       ),
+      excludeNodeIds: z.array(z.string()).optional().describe(
+        'Skip these node IDs in the result (already-seen items, e.g. for paginated drill-downs)'
+      ),
+      outputFormat: z.enum(['markdown', 'json']).optional().default('markdown').describe(
+        '"markdown" (default, human-readable) or "json" (structured)'
+      ),
       environment: z.enum(['production', 'staging']).optional().describe(
         'WLO environment: "production" (default) or "staging"'
       ),
@@ -90,6 +97,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
       const env: WloEnvironment = params.environment ?? defaultEnv;
       setFormatEnvironment(env);
       const maxResults = params.maxResults ?? 5;
+      const excluded = new Set(params.excludeNodeIds ?? []);
 
       // Keyword match: split query into words, match if ANY word hits name/title/desc
       const matchesQuery = (node: import('./wlo-api.js').WloNode, q: string): boolean => {
@@ -100,6 +108,18 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
           node.properties?.['cclom:general_description']?.[0] ?? '',
         ].join(' ').toLowerCase();
         return words.some(w => haystack.includes(w));
+      };
+
+      const renderOut = (nodes: WloNode[], total: number, emptyMsg = 'Keine Sammlungen gefunden.') => {
+        // Apply excludeNodeIds, then re-cap to maxResults.
+        const kept = excluded.size
+          ? nodes.filter(n => !excluded.has(n.ref?.id ?? ''))
+          : nodes;
+        const formatted = formatNodes(kept.slice(0, maxResults));
+        const text = (params.outputFormat ?? 'markdown') === 'json'
+          ? renderToJson(formatted, total)
+          : (renderToText(formatted, total) || emptyMsg);
+        return { content: [{ type: 'text' as const, text }] };
       };
 
       try {
@@ -113,9 +133,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         if (query && !params.parentNodeId) {
           const directHits = await searchCollectionsByKeyword(env, query, maxResults);
           if (directHits.length > 0) {
-            const formatted = formatNodes(directHits);
-            const text = renderToText(formatted, directHits.length);
-            return { content: [{ type: 'text', text }] };
+            return renderOut(directHits, directHits.length);
           }
         }
 
@@ -123,9 +141,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         const level1 = await getChildCollections(env, startId, 100);
 
         if (!query) {
-          const formatted = formatNodes(level1.slice(0, maxResults));
-          const text = renderToText(formatted, level1.length);
-          return { content: [{ type: 'text', text: text || 'Keine Sammlungen gefunden.' }] };
+          return renderOut(level1, level1.length);
         }
 
         // Level-1: filter direct children by keyword
@@ -173,9 +189,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
           return { content: [{ type: 'text', text: `Keine Sammlungen gefunden für "${query}". Versuche einen übergeordneten Begriff (z.B. "Mathematik" statt "Bruchrechnung") oder frag nach verfügbaren Sammlungen ohne Suchbegriff.` }] };
         }
 
-        const formatted = formatNodes(matches.slice(0, maxResults));
-        const text = renderToText(formatted, matches.length);
-        return { content: [{ type: 'text', text: text || 'Keine Sammlungen gefunden.' }] };
+        return renderOut(matches, matches.length);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text', text: `Fehler bei der Sammlungssuche: ${msg}` }], isError: true };
@@ -211,6 +225,10 @@ Filters accept both German labels and full URIs.`,
       maxResults: z.number().int().min(1).max(20).optional().default(8).describe(
         'Maximum number of results (1–20, default 8)'
       ),
+      excludeNodeIds: z.array(z.string()).optional().describe(
+        'Skip these node IDs in the result (already-seen items)'
+      ),
+      outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
       environment: z.enum(['production', 'staging']).optional().describe(
         'WLO environment: "production" (default) or "staging"'
       ),
@@ -220,21 +238,31 @@ Filters accept both German labels and full URIs.`,
       setFormatEnvironment(env);
       const filters = buildFilterCriteria(params);
       const maxResults = params.maxResults ?? 8;
+      const excluded = new Set(params.excludeNodeIds ?? []);
 
       try {
         let response;
+        // Pull a slightly larger pool when excluding so the result still has
+        // enough entries after filtering — otherwise excludeNodeIds=N makes
+        // the result list N items shorter without warning.
+        const pool = excluded.size > 0 ? Math.min(maxResults + excluded.size, 20) : maxResults;
         if (params.query.trim()) {
-          response = await enhancedSearch(env, params.query, 'FILES', filters, maxResults);
+          response = await enhancedSearch(env, params.query, 'FILES', filters, pool);
         } else {
           const browseCriteria: SearchCriterion[] = filters.length
             ? filters
             : [{ property: 'ngsearchword', values: ['*'] }];
-          response = await ngsearch(env, browseCriteria, 'FILES', maxResults);
+          response = await ngsearch(env, browseCriteria, 'FILES', pool);
         }
 
-        const formatted = formatNodes(response.nodes);
-        const text = renderToText(formatted, response.pagination.total);
-        return { content: [{ type: 'text', text: text || 'Keine Inhalte gefunden.' }] };
+        const kept = excluded.size
+          ? response.nodes.filter(n => !excluded.has(n.ref?.id ?? ''))
+          : response.nodes;
+        const formatted = formatNodes(kept.slice(0, maxResults));
+        const text = (params.outputFormat ?? 'markdown') === 'json'
+          ? renderToJson(formatted, response.pagination.total)
+          : (renderToText(formatted, response.pagination.total) || 'Keine Inhalte gefunden.');
+        return { content: [{ type: 'text', text }] };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text', text: `Fehler bei der Inhaltssuche: ${msg}` }], isError: true };
@@ -268,6 +296,10 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
       skipCount: z.number().int().min(0).optional().default(0).describe(
         'Number of items to skip for pagination (default 0)'
       ),
+      excludeNodeIds: z.array(z.string()).optional().describe(
+        'Skip these node IDs in the result'
+      ),
+      outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
       environment: z.enum(['production', 'staging']).optional().describe(
         'WLO environment: "production" (default) or "staging"'
       ),
@@ -278,9 +310,10 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
       const filter = (params.contentFilter ?? 'files') as 'files' | 'folders' | 'both';
       const maxResults = params.maxResults ?? 20;
       const skipCount = params.skipCount ?? 0;
+      const excluded = new Set(params.excludeNodeIds ?? []);
 
       try {
-        let allNodes: ReturnType<typeof formatNodes>[0][] = [];
+        let allNodes: FormattedNode[] = [];
         let totalHits = 0;
 
         if (params.includeSubcollections && filter === 'files') {
@@ -297,6 +330,7 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
             const filesResp = await getCollectionContents(env, cid, 'files', 50);
             totalHits += filesResp.pagination.total;
             let fileNodes = filesResp.nodes;
+            if (excluded.size) fileNodes = fileNodes.filter(n => !excluded.has(n.ref?.id ?? ''));
             if (params.query?.trim()) fileNodes = rerankNodes(fileNodes, params.query);
             allNodes.push(...formatNodes(fileNodes));
 
@@ -309,17 +343,20 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
           }
           allNodes = allNodes.slice(0, maxResults);
         } else {
-          const response = await getCollectionContents(env, params.nodeId, filter, maxResults, skipCount);
+          const response = await getCollectionContents(env, params.nodeId, filter, maxResults + excluded.size, skipCount);
           totalHits = response.pagination.total;
           let nodes = response.nodes;
+          if (excluded.size) nodes = nodes.filter(n => !excluded.has(n.ref?.id ?? ''));
           if (params.query?.trim() && filter !== 'folders') {
             nodes = rerankNodes(nodes, params.query);
           }
           allNodes = formatNodes(nodes.slice(0, maxResults));
         }
 
-        const text = renderToText(allNodes, totalHits);
-        return { content: [{ type: 'text', text: text || 'Sammlung ist leer oder nodeId nicht gefunden.' }] };
+        const text = (params.outputFormat ?? 'markdown') === 'json'
+          ? renderToJson(allNodes, totalHits)
+          : (renderToText(allNodes, totalHits) || 'Sammlung ist leer oder nodeId nicht gefunden.');
+        return { content: [{ type: 'text', text }] };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text', text: `Fehler beim Abruf der Sammlungsinhalte: ${msg}` }], isError: true };
@@ -331,9 +368,16 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
   server.tool(
     'get_node_details',
     `Retrieve detailed metadata, stored full-text content, and/or parent collections for a specific WLO node.
-- Metadata: title, description, keywords, subject, educational level, license, publisher, URL
-- textContent: the crawled/stored full text of the linked web page or document (when available)
-- parents: the collection(s) this node belongs to (useful to find which Sammlung a content item is in)`,
+
+Returns the SAME field structure as search tools (formatNode):
+title, description, keywords, disciplines (labels), educationalContexts (labels),
+userRoles (labels), learningResourceTypes (labels), license (label), publisher,
+url, previewUrl, topicPageUrl, nodeType.
+
+Plus optional:
+- textContent: the crawled/stored full text of the linked web page or document
+- parents: the collection(s) this node belongs to (useful to find which Sammlung a content item is in)
+- raw: the original ccm:* / cclom:* property URIs (for debugging / advanced use)`,
     {
       nodeId: z.string().describe('Node ID of a content item or collection (from search results)'),
       includeTextContent: z.boolean().optional().default(false).describe(
@@ -342,12 +386,19 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
       includeParents: z.boolean().optional().default(false).describe(
         'Also fetch the parent collections this node belongs to'
       ),
+      includeRaw: z.boolean().optional().default(false).describe(
+        'Include raw URI values alongside the resolved labels'
+      ),
+      outputFormat: z.enum(['markdown', 'json']).optional().default('markdown').describe(
+        '"markdown" (default, human-readable) or "json" (structured data, easier to parse for callers)'
+      ),
       environment: z.enum(['production', 'staging']).optional().describe(
         'WLO environment: "production" (default) or "staging"'
       ),
     },
     async (params) => {
       const env: WloEnvironment = params.environment ?? defaultEnv;
+      setFormatEnvironment(env);
 
       try {
         const node = await getNodeMetadata(env, params.nodeId);
@@ -356,49 +407,73 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
         }
 
         const props = node.properties ?? {};
-        const lines: string[] = [];
+        const formatted = formatNode(node);
 
-        const title = (props['cclom:title']?.[0] ?? props['cm:name']?.[0] ?? params.nodeId);
-        lines.push(`## ${title}`);
-        lines.push(`nodeId: ${params.nodeId}`);
-
-        const desc = props['cclom:general_description']?.[0];
-        if (desc) lines.push(`Beschreibung: ${desc}`);
-
-        const keywords = props['cclom:general_keyword'];
-        if (keywords?.length) lines.push(`Schlagworte: ${keywords.join(', ')}`);
-
-        const subject = props['ccm:taxonid'];
-        if (subject?.length) lines.push(`Fach-URI: ${subject.join(', ')}`);
-
-        const eduCtx = props['ccm:educationalcontext'];
-        if (eduCtx?.length) lines.push(`Bildungsstufe-URI: ${eduCtx.join(', ')}`);
-
-        const license = props['ccm:commonlicense_key']?.[0];
-        if (license) lines.push(`Lizenz: ${license}`);
-
-        const publisher = props['ccm:oeh_publisher_combined']?.[0] ?? props['ccm:metadatacontributer_publisher']?.[0];
-        if (publisher) lines.push(`Anbieter: ${publisher}`);
-
-        const url = props['ccm:wwwurl']?.[0] ?? props['cclom:location']?.[0];
-        if (url && !url.startsWith('ccrep://')) lines.push(`URL: ${url}`);
-
+        // Extras that don't fit into FormattedNode
         const renderUrl = `https://redaktion.openeduhub.net/edu-sharing/components/render/${params.nodeId}`;
+        const fullText = params.includeTextContent ? await getNodeTextContent(env, params.nodeId) : null;
+        const parents = params.includeParents ? await getNodeParents(env, params.nodeId) : [];
+
+        // ── JSON output ───────────────────────────────────────────────────
+        if (params.outputFormat === 'json') {
+          const payload: Record<string, unknown> = {
+            ...formatted,
+            renderUrl,
+          };
+          if (params.includeParents) {
+            payload['parents'] = parents.map(p => ({
+              nodeId: p.ref?.id ?? '',
+              title: p.properties?.['cclom:title']?.[0] ?? p.properties?.['cm:name']?.[0] ?? p.name ?? '',
+            }));
+          }
+          if (params.includeTextContent) {
+            payload['textContent'] = fullText && fullText.length > 4000
+              ? fullText.slice(0, 4000) + '\n[…gekürzt]'
+              : (fullText ?? '');
+          }
+          if (params.includeRaw) {
+            payload['raw'] = {
+              disciplines: props['ccm:taxonid'] ?? [],
+              educationalContexts: props['ccm:educationalcontext'] ?? [],
+              userRoles: props['ccm:oeh_intended_end_user_role'] ?? [],
+              learningResourceTypes: props['ccm:oeh_lrt_aggregated'] ?? [],
+              license: props['ccm:commonlicense_key']?.[0] ?? '',
+            };
+          }
+          return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+        }
+
+        // ── Markdown output (default, backward-compat with consumers that parse text) ──
+        const lines: string[] = [];
+        lines.push(`## ${formatted.title || params.nodeId}`);
+        lines.push(`nodeId: ${params.nodeId}`);
+        if (formatted.description) lines.push(`Beschreibung: ${formatted.description}`);
+        if (formatted.keywords.length) lines.push(`Schlagworte: ${formatted.keywords.join(', ')}`);
+        if (formatted.disciplines.length) lines.push(`Fach: ${formatted.disciplines.join(', ')}`);
+        if (formatted.educationalContexts.length) lines.push(`Bildungsstufe: ${formatted.educationalContexts.join(', ')}`);
+        if (formatted.userRoles.length) lines.push(`Zielgruppe: ${formatted.userRoles.join(', ')}`);
+        if (formatted.learningResourceTypes.length) lines.push(`Ressourcentyp: ${formatted.learningResourceTypes.join(', ')}`);
+        if (formatted.license) lines.push(`Lizenz: ${formatted.license}`);
+        if (formatted.publisher) lines.push(`Anbieter: ${formatted.publisher}`);
+        if (formatted.url) lines.push(`URL: ${formatted.url}`);
+        if (formatted.previewUrl) lines.push(`Vorschaubild: ${formatted.previewUrl}`);
         lines.push(`WLO-URL: ${renderUrl}`);
+        if (formatted.topicPageUrl) lines.push(`Themenseite: ${formatted.topicPageUrl}`);
+        lines.push(`Typ: ${formatted.nodeType === 'collection' ? 'Sammlung' : 'Inhalt'}`);
 
-        const pageConfigRef = props['ccm:page_config_ref']?.[0];
-        const topicPageUrl = buildTopicPageUrl(env, params.nodeId, pageConfigRef);
-        if (topicPageUrl) lines.push(`Themenseite: ${topicPageUrl}`);
-
-        const nodeType = props['cm:objecttype']?.[0];
-        if (nodeType) lines.push(`Typ: ${nodeType}`);
+        if (params.includeRaw) {
+          lines.push(`\n### Raw URIs`);
+          if (props['ccm:taxonid']?.length) lines.push(`Fach-URI: ${props['ccm:taxonid'].join(', ')}`);
+          if (props['ccm:educationalcontext']?.length) lines.push(`Bildungsstufe-URI: ${props['ccm:educationalcontext'].join(', ')}`);
+          const rawLicense = props['ccm:commonlicense_key']?.[0];
+          if (rawLicense) lines.push(`Lizenz-Key: ${rawLicense}`);
+        }
 
         if (params.includeParents) {
-          const parents = await getNodeParents(env, params.nodeId);
           if (parents.length > 0) {
             lines.push(`\n### Eltern-Sammlungen (${parents.length})`);
             for (const p of parents) {
-              const pName = (p.properties?.['cm:name']?.[0] ?? p.name ?? p.ref?.id ?? '?');
+              const pName = (p.properties?.['cclom:title']?.[0] ?? p.properties?.['cm:name']?.[0] ?? p.name ?? p.ref?.id ?? '?');
               const pId = p.ref?.id ?? '?';
               lines.push(`- ${pName} (nodeId: ${pId})`);
             }
@@ -408,9 +483,8 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
         }
 
         if (params.includeTextContent) {
-          const text = await getNodeTextContent(env, params.nodeId);
-          if (text) {
-            const trimmed = text.length > 2000 ? text.slice(0, 2000) + '\n[…gekürzt]' : text;
+          if (fullText) {
+            const trimmed = fullText.length > 2000 ? fullText.slice(0, 2000) + '\n[…gekürzt]' : fullText;
             lines.push(`\n### Gespeicherter Volltext`);
             lines.push(trimmed);
           } else {
@@ -426,93 +500,6 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
     },
   );
 
-  // ── Helper for web tools ─────────────────────────────────────────────────
-  const makeWebTool = (base: string) => async (params: { path?: string; maxLength?: number }) => {
-    try {
-      const url = base + (params.path ?? '');
-      const raw = await fetchWebContent(url);
-      const limit = params.maxLength ?? 8000;
-      const trimmed = raw.length > limit
-        ? raw.slice(0, limit) + `\n\n[…abgeschnitten. Unterseite wählen oder maxLength erhöhen.]`
-        : raw;
-      return { content: [{ type: 'text' as const, text: trimmed || 'Kein Inhalt extrahiert.' }] };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { content: [{ type: 'text' as const, text: `Fehler: ${msg}` }], isError: true };
-    }
-  };
-  const webParams = {
-    path: z.string().optional().describe(
-      'Optional subpage path, e.g. "/fachportale/informatik". Leave empty for the main page.'
-    ),
-    maxLength: z.number().int().min(500).max(20000).optional().default(8000).describe(
-      'Maximum characters to return (default 8000)'
-    ),
-  };
-
-  const webNav = `
-Multi-level exploration strategy (up to 5 levels):
-1. Call this tool without a path to fetch the main page and discover navigation links.
-2. Identify the ONE most relevant link for the user's question.
-3. Call this tool again with that path to get the subpage content.
-4. Repeat steps 2–3 up to 5 levels total until you have enough information to answer.
-Only follow ONE link per level – do not fetch multiple pages at the same depth.`;
-
-  // ── Tool 5a: get_wirlernenonline_info ────────────────────────────────────
-  server.tool(
-    'get_wirlernenonline_info',
-    `Fetch information from WirLernenOnline (WLO) – the German OER portal website.
-Use this tool when the user asks about: WirLernenOnline, WLO, OER, OER-Statistik, Fachportale,
-Qualitätssicherung, Quellenerschließung, WLO Plug-ins, Mitmachen, Fachredaktion,
-or portal/subject names like Informatik, Deutsch, Medienbildung, Zeitgemäße Bildung,
-Nachhaltigkeit, ComeIn.
-Base URL: https://www.wirlernenonline.de
-${webNav}`,
-    webParams,
-    makeWebTool('https://www.wirlernenonline.de'),
-  );
-
-  // ── Tool 5b: get_edu_sharing_network_info ────────────────────────────────
-  server.tool(
-    'get_edu_sharing_network_info',
-    `Fetch information from edu-sharing-network.org – the edu-sharing community and network site.
-Use this tool when the user asks about: edu-sharing Vernetzung, Bildungscloud, offene Bildung,
-Community, open source, E-Learning, or project/event names like ITsJOINTLY, JOINTLY, BIRD,
-Bildungsraum Digital, OER-Statistik, OER- & IT-Sommercamp, Hackathon,
-Hackathons für OER-Softwarelösungen, WirLernenOnline (Projektkontext).
-Base URL: https://edu-sharing-network.org
-${webNav}`,
-    webParams,
-    makeWebTool('https://edu-sharing-network.org'),
-  );
-
-  // ── Tool 5c: get_edu_sharing_product_info ───────────────────────────────
-  server.tool(
-    'get_edu_sharing_product_info',
-    `Fetch information from edu-sharing.com – the edu-sharing software product website.
-Use this tool when the user asks about: edu-sharing, Open Source, Bildungscloud,
-Enterprise Suchmaschine, Suchmaschine, E-Learning Cloudspeicher, Repository,
-Portal für Bildungsmedien, Cloudspeicher, Tools & Plugins, Architektur & Integration,
-Dokumentation, Downloads, Moodle Integration, App, Demo.
-Base URL: https://edu-sharing.com
-${webNav}`,
-    webParams,
-    makeWebTool('https://edu-sharing.com'),
-  );
-
-  // ── Tool 5d: get_metaventis_info ─────────────────────────────────────────
-  server.tool(
-    'get_metaventis_info',
-    `Fetch information from metaventis.com – the metaVentis company website (edu-sharing core dev team).
-Use this tool when the user asks about: metaVentis, edu-sharing Kern-Entwicklerteam,
-Landes-Schulcloud, OER auf Landesebene, IDM Landeskonzepte, Autoren- & Redaktions-Lösung,
-IT-Partner für F&E-Projekte, Firmenwissen und E-Learning integriert.
-Base URL: https://metaventis.com
-${webNav}`,
-    webParams,
-    makeWebTool('https://metaventis.com'),
-  );
-
   // ── Tool 6: lookup_wlo_vocabulary ─────────────────────────────────────────
   server.tool(
     'lookup_wlo_vocabulary',
@@ -521,12 +508,14 @@ Use this to discover valid labels and URIs for Bildungsstufe (educational contex
 Schulfach/Disziplin, Zielgruppe (user role), or Lernressourcentyp (learning resource type).
 Useful before calling search tools to find the correct filter values.`,
     {
-      vocabulary: z.enum(['educationalContext', 'discipline', 'userRole', 'lrt']).describe(
+      vocabulary: z.enum(['educationalContext', 'discipline', 'userRole', 'lrt', 'license', 'targetGroup']).describe(
         'Which vocabulary to list: ' +
         '"educationalContext" (Bildungsstufen), ' +
         '"discipline" (Schulfächer), ' +
         '"userRole" (Zielgruppen), ' +
-        '"lrt" (Lernressourcentypen aggregiert)'
+        '"lrt" (Lernressourcentypen aggregiert), ' +
+        '"license" (CC-Lizenzen), ' +
+        '"targetGroup" (Themenseiten-Zielgruppen: teacher/learner/general)'
       ),
     },
     async (params) => {
@@ -538,6 +527,8 @@ Useful before calling search tools to find the correct filter values.`,
         discipline:         'Schulfach / Disziplin (discipline)',
         userRole:           'Zielgruppe (userRole)',
         lrt:                'Lernressourcentyp aggregiert (lrt)',
+        license:            'Lizenzen (license)',
+        targetGroup:        'Themenseiten-Zielgruppe (targetGroup)',
       };
 
       const lines: string[] = [`# Vokabular: ${vocabNames[vocab]}`, ''];
@@ -558,11 +549,17 @@ Useful before calling search tools to find the correct filter values.`,
 Themenseiten are curated page layouts with swimlanes, tailored to different target groups
 (Lehrkräfte, Lernende, Allgemein). They are linked to Sammlungen (collections).
 
-Two search modes:
-1. By topic (query): Searches collections first, then checks which ones have a Themenseite.
-2. By filters only: Lists all available Themenseiten, optionally filtered by target group or educational context.
+Three search modes:
+1. By collectionId: Direct check whether a specific collection has a Themenseite.
+2. By topic (query): Searches collections first, then checks which ones have a Themenseite.
+3. By filters only (no query): Lists Themenseiten, optionally filtered by target group or educational context.
 
-Returns the topic-page URL that can be opened directly in the browser.`,
+Output:
+- Each result has the OWNING COLLECTION as title (no more cryptic "PAGE_VARIANT_xxx" names).
+- Multiple variants of the same Themenseite (different target groups) are merged into one entry.
+- Target groups are returned as readable labels ("Lehrkräfte"), not slugs.
+
+Order: deterministic. By default sorted alphabetically by collection name with nodeId as tie-breaker.`,
     {
       query: z.string().optional().default('').describe(
         'Thematic search query in German, e.g. "Physik" or "Farben". ' +
@@ -578,7 +575,18 @@ Returns the topic-page URL that can be opened directly in the browser.`,
         'Directly check a specific collection (nodeId) for its Themenseite. ' +
         'Bypasses the search – useful when you already have a collection from search_wlo_collections.'
       ),
+      mergeVariants: z.boolean().optional().default(true).describe(
+        'When true (default), multiple variants of the same Themenseite (different target groups) ' +
+        'are merged into a single entry with all variant URLs listed.'
+      ),
+      sort: z.enum(['relevance', 'alpha']).optional().default('alpha').describe(
+        '"alpha" (default, deterministic) sorts by collection name; ' +
+        '"relevance" keeps the order returned by the underlying search (only meaningful with a query).'
+      ),
       maxResults: z.number().int().min(1).max(20).optional().default(5),
+      outputFormat: z.enum(['markdown', 'json']).optional().default('markdown').describe(
+        '"markdown" (default) or "json" (structured)'
+      ),
       environment: z.enum(['production', 'staging']).optional().describe(
         'WLO environment: "production" (default) or "staging"'
       ),
@@ -586,6 +594,8 @@ Returns the topic-page URL that can be opened directly in the browser.`,
     async (params) => {
       const env: WloEnvironment = params.environment ?? defaultEnv;
       const tg = params.targetGroup as TargetGroup | undefined;
+      const sort = params.sort ?? 'alpha';
+      const merge = params.mergeVariants !== false;
 
       try {
         const results: ThemePageInfo[] = [];
@@ -605,7 +615,7 @@ Returns the topic-page URL that can be opened directly in the browser.`,
             if (!pageConfigRef) continue;
             const pages = await getCollectionThemePages(env, cId, tg);
             results.push(...pages);
-            if (results.length >= (params.maxResults ?? 5)) break;
+            if (results.length >= (params.maxResults ?? 5) * 3) break;
           }
         }
         // ── Mode C: List all Themenseiten (page_variant API) ─────────────────
@@ -613,24 +623,40 @@ Returns the topic-page URL that can be opened directly in the browser.`,
           const eduCtxUri = params.educationalContext
             ? resolveVocab(params.educationalContext, 'educationalContext') ?? params.educationalContext
             : undefined;
+          // Fetch more variants than maxResults so the dedup/merge step still
+          // has enough candidates after grouping by collection.
           const variants = await searchPageVariants(env, {
             isTemplate: false,
             targetGroup: tg,
             educationalContext: eduCtxUri,
-          }, params.maxResults ?? 5);
+          }, Math.max(50, (params.maxResults ?? 5) * 5));
 
-          for (const v of variants) {
+          // Resolve owning collections in parallel so the result has
+          // human-readable titles instead of "PAGE_VARIANT_xxx".
+          const enriched = await Promise.allSettled(variants.map(async (v) => {
             const vProps = v.properties ?? {};
-            results.push({
-              variantId: v.ref?.id ?? '',
+            const variantId = v.ref?.id ?? '';
+            if (!variantId) return null;
+            const owner = await resolveVariantCollection(env, variantId);
+            const ownerNode = owner ? await getNodeMetadata(env, owner.id) : null;
+            const ownerProps = ownerNode?.properties ?? {};
+            const pageConfigRef = ownerProps['ccm:page_config_ref']?.[0];
+            const topicPageUrl = owner ? buildTopicPageUrl(env, owner.id, pageConfigRef) ?? '' : '';
+
+            return {
+              variantId,
               variantName: vProps['cm:name']?.[0] || v.name || '',
-              targetGroup: vProps['ccm:page_variant_profiling_target_group']?.[0] || 'nicht gesetzt',
+              targetGroup: vProps['ccm:page_variant_profiling_target_group']?.[0] || '',
               educationalContexts: vProps['ccm:educationalcontext'] ?? [],
               isTemplate: false,
-              topicPageUrl: '',
-              collectionId: undefined,
-              collectionName: undefined,
-            });
+              topicPageUrl,
+              collectionId: owner?.id,
+              collectionName: owner?.name,
+            } satisfies ThemePageInfo;
+          }));
+
+          for (const r of enriched) {
+            if (r.status === 'fulfilled' && r.value) results.push(r.value);
           }
         }
 
@@ -641,22 +667,101 @@ Returns the topic-page URL that can be opened directly in the browser.`,
           return { content: [{ type: 'text', text: hint }] };
         }
 
-        // Format output
-        const lines: string[] = [`Gefundene Themenseiten: ${results.length}\n`];
-        for (const r of results.slice(0, params.maxResults ?? 5)) {
-          const parts: string[] = [];
-          parts.push(`## ${r.collectionName || r.variantName}`);
-          if (r.collectionId) parts.push(`Sammlung-nodeId: ${r.collectionId}`);
-          parts.push(`Variante-ID: ${r.variantId}`);
-          parts.push(`Zielgruppe: ${r.targetGroup}`);
-          if (r.educationalContexts.length) {
-            const labels = r.educationalContexts.map(u => {
-              const l = labelFromUri(u, 'educationalContext');
-              return l !== u ? l : u;
+        // Build "presented" entries: optionally merge variants of the same
+        // collection into one entry, resolve target-group/edu-context labels.
+        type Variant = { variantId: string; targetGroup: string; targetGroupLabel: string; topicPageUrl: string };
+        type Presented = {
+          title: string;
+          collectionId: string;
+          variants: Variant[];
+          educationalContexts: string[];
+          topicPageUrl: string;
+        };
+
+        const seen = new Map<string, Presented>();
+        const order: string[] = [];
+
+        for (const r of results) {
+          const collectionId = r.collectionId ?? r.variantId;
+          const title = r.collectionName?.trim() || r.variantName || collectionId;
+          const eduLabels = r.educationalContexts.map(u => labelFromUri(u, 'educationalContext'));
+          const tgLabel = r.targetGroup ? labelFromUri(r.targetGroup, 'targetGroup') : 'nicht gesetzt';
+          const variant: Variant = {
+            variantId: r.variantId,
+            targetGroup: r.targetGroup || '',
+            targetGroupLabel: tgLabel,
+            topicPageUrl: r.topicPageUrl,
+          };
+
+          const key = merge ? collectionId : r.variantId;
+          if (seen.has(key)) {
+            const ex = seen.get(key)!;
+            if (!ex.variants.some(v => v.variantId === variant.variantId)) ex.variants.push(variant);
+            for (const e of eduLabels) if (!ex.educationalContexts.includes(e)) ex.educationalContexts.push(e);
+            if (!ex.topicPageUrl && variant.topicPageUrl) ex.topicPageUrl = variant.topicPageUrl;
+          } else {
+            seen.set(key, {
+              title,
+              collectionId,
+              variants: [variant],
+              educationalContexts: eduLabels,
+              topicPageUrl: r.topicPageUrl,
             });
-            parts.push(`Bildungsstufe: ${labels.join(', ')}`);
+            order.push(key);
+          }
+        }
+
+        // Stable, deterministic ordering:
+        // - relevance: keep insertion order (tie-broken by collectionId)
+        // - alpha: sort by title (with collectionId tie-breaker)
+        const sortedKeys = sort === 'alpha'
+          ? [...order].sort((a, b) => {
+              const ta = (seen.get(a)?.title ?? '').toLowerCase();
+              const tb = (seen.get(b)?.title ?? '').toLowerCase();
+              if (ta !== tb) return ta.localeCompare(tb, 'de');
+              return a.localeCompare(b);
+            })
+          : [...order].sort((a, b) => {
+              // relevance: keep insertion order — tie-break alphabetically only
+              // when two entries appeared at the same position (rare).
+              return order.indexOf(a) - order.indexOf(b);
+            });
+
+        const out = sortedKeys.slice(0, params.maxResults ?? 5).map(k => seen.get(k)!);
+
+        // ── JSON output ───────────────────────────────────────────────────
+        if (params.outputFormat === 'json') {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                total: out.length,
+                results: out,
+              }, null, 2),
+            }],
+          };
+        }
+
+        // ── Markdown output ───────────────────────────────────────────────
+        const lines: string[] = [`Gefundene Themenseiten: ${out.length}\n`];
+        for (const r of out) {
+          const parts: string[] = [];
+          parts.push(`## ${r.title}`);
+          parts.push(`Sammlung-nodeId: ${r.collectionId}`);
+          if (r.educationalContexts.length) {
+            parts.push(`Bildungsstufe: ${r.educationalContexts.join(', ')}`);
           }
           if (r.topicPageUrl) parts.push(`Themenseite: ${r.topicPageUrl}`);
+          // List variants (target groups). One line per variant.
+          if (r.variants.length === 1) {
+            parts.push(`Zielgruppe: ${r.variants[0].targetGroupLabel}`);
+            parts.push(`Variante-ID: ${r.variants[0].variantId}`);
+          } else {
+            parts.push(`Varianten (${r.variants.length}):`);
+            for (const v of r.variants) {
+              parts.push(`  - ${v.targetGroupLabel} (Variante-ID: ${v.variantId})`);
+            }
+          }
           lines.push(parts.join('\n'));
           lines.push('');
         }
@@ -665,6 +770,273 @@ Returns the topic-page URL that can be opened directly in the browser.`,
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text', text: `Fehler bei der Themenseiten-Suche: ${msg}` }], isError: true };
       }
+    },
+  );
+
+  // ── Tool 8: get_subject_portals (Fachportale) ──────────────────────────────
+  server.tool(
+    'get_subject_portals',
+    `Lists the WLO Fachportale — the first-level Sammlungen directly under the WLO root collection.
+Fachportale are the top-level subject hubs (Mathematik, Informatik, Deutsch, …) that anchor the
+content tree. Each portal has an associated Themenseite when ccm:page_config_ref is set.
+
+Use this when the user wants an overview of what subjects/topics are covered, or as the natural
+entry point for guided drill-downs ("Zeig mir Mathe" → portal → sub-Sammlungen → Inhalte).
+
+Returns deterministic alphabetical ordering, with portal nodeId, name, description, optional
+Themenseiten-URL, and the disciplines/educational contexts associated with the portal.`,
+    {
+      educationalContext: z.string().optional().describe(
+        'Filter by educational level (e.g. "Sekundarstufe I"). Most portals span multiple levels — '+
+        'the filter only excludes portals where the level is explicitly different.'
+      ),
+      includeContentCounts: z.boolean().optional().default(false).describe(
+        'When true, also fetch the number of direct sub-collections per portal (extra round-trip).'
+      ),
+      outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
+      environment: z.enum(['production', 'staging']).optional(),
+    },
+    async (params) => {
+      const env: WloEnvironment = params.environment ?? defaultEnv;
+      setFormatEnvironment(env);
+
+      try {
+        const portals = await getChildCollections(env, WLO_ROOT_COLLECTION_IDS[env], 100);
+
+        // Optional educational-context filter
+        let filtered = portals;
+        if (params.educationalContext) {
+          const wantedUri = resolveVocab(params.educationalContext, 'educationalContext');
+          if (wantedUri) {
+            filtered = portals.filter(p => {
+              const ec = p.properties?.['ccm:educationalcontext'] ?? [];
+              // Keep portals that don't specify a context (apply to all) OR match.
+              return ec.length === 0 || ec.includes(wantedUri);
+            });
+          }
+        }
+
+        // Deterministic alphabetical sort
+        const sorted = sortByTitle(filtered);
+
+        // Optional content-count enrichment
+        const counts: Record<string, number> = {};
+        if (params.includeContentCounts) {
+          await Promise.allSettled(sorted.map(async p => {
+            const id = p.ref?.id;
+            if (!id) return;
+            const subs = await getChildCollections(env, id, 100);
+            counts[id] = subs.length;
+          }));
+        }
+
+        const formatted = sorted.map(p => {
+          const f = formatNode(p);
+          return {
+            ...f,
+            subCollectionCount: params.includeContentCounts ? (counts[f.nodeId] ?? 0) : undefined,
+          };
+        });
+
+        if (params.outputFormat === 'json') {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({ total: formatted.length, results: formatted }, null, 2),
+            }],
+          };
+        }
+
+        const lines: string[] = [`WLO Fachportale: ${formatted.length}\n`];
+        for (const p of formatted) {
+          const parts: string[] = [];
+          parts.push(`## ${p.title}`);
+          parts.push(`nodeId: ${p.nodeId}`);
+          if (p.description) parts.push(`Beschreibung: ${p.description.slice(0, 300)}${p.description.length > 300 ? '…' : ''}`);
+          if (p.disciplines.length) parts.push(`Fach: ${p.disciplines.join(', ')}`);
+          if (p.educationalContexts.length) parts.push(`Bildungsstufe: ${p.educationalContexts.join(', ')}`);
+          if (p.topicPageUrl) parts.push(`Themenseite: ${p.topicPageUrl}`);
+          if (p.subCollectionCount !== undefined) parts.push(`Sub-Sammlungen: ${p.subCollectionCount}`);
+          lines.push(parts.join('\n'));
+          lines.push('');
+        }
+        return { content: [{ type: 'text', text: lines.join('\n').trim() }] };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: 'text', text: `Fehler beim Abruf der Fachportale: ${msg}` }], isError: true };
+      }
+    },
+  );
+
+  // ── Tool 9: browse_collection_tree ─────────────────────────────────────────
+  server.tool(
+    'browse_collection_tree',
+    `Drill into the sub-collection tree below a given collection.
+Returns the direct sub-Sammlungen at \`depth=1\` (default) or two levels at \`depth=2\`.
+Optionally enriches each node with the count of files (Lernmaterialien) it contains.
+
+Use this for guided exploration: pick a Fachportal or Themenseite, then let the user
+choose a sub-area before fetching individual content items. Output is deterministic
+(alphabetical by name, nodeId tie-breaker).`,
+    {
+      nodeId: z.string().describe('Parent collection nodeId. Use a Fachportal nodeId from get_subject_portals as a starting point.'),
+      depth: z.number().int().min(1).max(2).optional().default(1).describe(
+        '1 = direct sub-collections only (fast); 2 = also include grand-children (more API calls).'
+      ),
+      includeContentCounts: z.boolean().optional().default(false).describe(
+        'When true, fetch the number of files (Inhalte) inside each sub-collection (extra round-trip per node).'
+      ),
+      maxResults: z.number().int().min(1).max(100).optional().default(50),
+      outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
+      environment: z.enum(['production', 'staging']).optional(),
+    },
+    async (params) => {
+      const env: WloEnvironment = params.environment ?? defaultEnv;
+      setFormatEnvironment(env);
+      const depth = params.depth ?? 1;
+
+      try {
+        const level1 = await getChildCollections(env, params.nodeId, params.maxResults ?? 50);
+        const sorted1 = sortByTitle(level1);
+
+        type TreeNode = ReturnType<typeof formatNode> & {
+          fileCount?: number;
+          children?: TreeNode[];
+        };
+
+        const enrichOne = async (n: WloNode): Promise<TreeNode> => {
+          const f = formatNode(n) as TreeNode;
+          if (params.includeContentCounts) {
+            const id = n.ref?.id;
+            if (id) {
+              const filesResp = await getCollectionContents(env, id, 'files', 1, 0);
+              f.fileCount = filesResp.pagination.total;
+            }
+          }
+          if (depth === 2) {
+            const id = n.ref?.id;
+            if (id) {
+              const children = await getChildCollections(env, id, 30);
+              const sortedChildren = sortByTitle(children);
+              f.children = await Promise.all(sortedChildren.map(c => enrichOne(c)));
+            }
+          }
+          return f;
+        };
+
+        const tree = await Promise.all(sorted1.map(n => enrichOne(n)));
+
+        if (params.outputFormat === 'json') {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({ parent: params.nodeId, depth, total: tree.length, results: tree }, null, 2),
+            }],
+          };
+        }
+
+        const lines: string[] = [`Sub-Sammlungen unter ${params.nodeId}: ${tree.length} (Tiefe ${depth})\n`];
+        const renderTree = (nodes: TreeNode[], indent: number) => {
+          for (const n of nodes) {
+            const pad = '  '.repeat(indent);
+            const cnt = n.fileCount !== undefined ? ` [${n.fileCount} Inhalte]` : '';
+            lines.push(`${pad}- **${n.title}** (${n.nodeId})${cnt}`);
+            if (n.children?.length) renderTree(n.children, indent + 1);
+          }
+        };
+        renderTree(tree, 0);
+        return { content: [{ type: 'text', text: lines.join('\n').trim() }] };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: 'text', text: `Fehler beim Sub-Sammlungs-Abruf: ${msg}` }], isError: true };
+      }
+    },
+  );
+
+  // ── Tool 10: wlo_health_check ─────────────────────────────────────────────
+  server.tool(
+    'wlo_health_check',
+    `Probe whether the WLO repository API is reachable and responding.
+Returns latency in ms, the resolved root collection nodeId, and a status flag.
+Useful for callers (e.g. chatbots) to quickly tell "WLO is down" from "your query produced no hits".`,
+    {
+      environment: z.enum(['production', 'staging']).optional(),
+    },
+    async (params) => {
+      const env: WloEnvironment = params.environment ?? defaultEnv;
+      const t0 = Date.now();
+      try {
+        const root = WLO_ROOT_COLLECTION_IDS[env];
+        const node = await getNodeMetadata(env, root);
+        const latencyMs = Date.now() - t0;
+        const ok = node !== null;
+        const payload = {
+          ok,
+          environment: env,
+          baseUrl: BASE_URLS[env],
+          rootNodeId: root,
+          rootResolved: ok ? (node.properties?.['cclom:title']?.[0] ?? node.properties?.['cm:name']?.[0] ?? null) : null,
+          latencyMs,
+          checkedAt: new Date().toISOString(),
+        };
+        return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const payload = {
+          ok: false,
+          environment: env,
+          baseUrl: BASE_URLS[env],
+          error: msg,
+          latencyMs: Date.now() - t0,
+          checkedAt: new Date().toISOString(),
+        };
+        return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true };
+      }
+    },
+  );
+
+  // ── Tool 11: get_nodes_details (Bulk metadata) ─────────────────────────────
+  server.tool(
+    'get_nodes_details',
+    `Bulk-fetch metadata for multiple node IDs in parallel.
+Saves N round-trips when callers need details for many nodes (e.g. resolve cards from a search).
+Returns the same FormattedNode shape as get_node_details (json mode), keyed by nodeId.
+
+Failed lookups (deleted node, network error) are returned in the \`failed\` array, not as
+overall errors — so a single bad nodeId doesn't ruin the whole batch.`,
+    {
+      nodeIds: z.array(z.string()).min(1).max(50).describe(
+        'Array of node IDs to fetch (max 50 per call).'
+      ),
+      environment: z.enum(['production', 'staging']).optional(),
+    },
+    async (params) => {
+      const env: WloEnvironment = params.environment ?? defaultEnv;
+      setFormatEnvironment(env);
+
+      const ids = Array.from(new Set(params.nodeIds.filter(Boolean)));
+      const settled = await Promise.allSettled(ids.map(id => getNodeMetadata(env, id)));
+      const results: Record<string, ReturnType<typeof formatNode>> = {};
+      const failed: string[] = [];
+      ids.forEach((id, i) => {
+        const r = settled[i];
+        if (r.status === 'fulfilled' && r.value) {
+          results[id] = formatNode(r.value);
+        } else {
+          failed.push(id);
+        }
+      });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            requested: ids.length,
+            resolved: Object.keys(results).length,
+            failed,
+            results,
+          }, null, 2),
+        }],
+      };
     },
   );
 
