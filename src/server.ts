@@ -6,11 +6,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { WloEnvironment, SearchCriterion } from './wlo-api.js';
-import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getCollectionMetadata, getNodeTextContent, getNodeParents, WLO_ROOT_COLLECTION_IDS, searchPageVariants, getCollectionThemePages, buildTopicPageUrl, BASE_URLS, resolveVariantCollection } from './wlo-api.js';
+import type { SearchCriterion } from './wlo-api.js';
+import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, WLO_ROOT_COLLECTION_ID, searchPageVariants, getCollectionThemePages, buildTopicPageUrl, buildRenderUrl, BASE_URL, WLO_REPOSITORY_URL, resolveVariantCollection } from './wlo-api.js';
 import type { TargetGroup, ThemePageInfo, WloNode } from './wlo-api.js';
 import { enhancedSearch, rerankNodes, sortByTitle } from './reranker.js';
-import { formatNodes, formatNode, renderToText, renderToJson, setFormatEnvironment } from './formatter.js';
+import { formatNodes, formatNode, renderToText, renderToJson } from './formatter.js';
 import type { FormattedNode } from './formatter.js';
 import { resolveVocab, listVocab, labelFromUri, type VocabKey } from './vocabs.js';
 
@@ -49,7 +49,10 @@ function buildFilterCriteria(params: {
 // ── Factory ──────────────────────────────────────────────────────────────────
 
 export function createMcpServer(): McpServer {
-  const defaultEnv = (process.env['WLO_ENV'] ?? 'production') as WloEnvironment;
+  // Repository URL kommt global aus dem ``WLO_REPOSITORY_URL``-Env (siehe
+  // ``wlo-api.ts``). Pro Server-Instanz wird ein einziger Edu-Sharing-
+  // Endpoint adressiert — Switch zwischen Prod/Staging passiert per
+  // separatem Deployment mit unterschiedlicher Env-Variable.
 
   const server = new McpServer({
     name: 'wlo-mcp',
@@ -89,13 +92,8 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown').describe(
         '"markdown" (default, human-readable) or "json" (structured)'
       ),
-      environment: z.enum(['production', 'staging']).optional().describe(
-        'WLO environment: "production" (default) or "staging"'
-      ),
     },
     async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
-      setFormatEnvironment(env);
       const maxResults = params.maxResults ?? 5;
       const excluded = new Set(params.excludeNodeIds ?? []);
 
@@ -125,20 +123,20 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
       try {
         const query    = params.query.trim();
         // Use parentNodeId if given, otherwise start from WLO root
-        const startId  = params.parentNodeId ?? WLO_ROOT_COLLECTION_IDS[env];
+        const startId  = params.parentNodeId ?? WLO_ROOT_COLLECTION_ID;
 
         // ── Primary: full-text search via contentType=COLLECTIONS ─────────────
         // Only use for root-level search (no parentNodeId) so guided traversal
         // still works correctly when the client restricts to a subtree.
         if (query && !params.parentNodeId) {
-          const directHits = await searchCollectionsByKeyword(env, query, maxResults);
+          const directHits = await searchCollectionsByKeyword(query, maxResults);
           if (directHits.length > 0) {
             return renderOut(directHits, directHits.length);
           }
         }
 
         // ── Fallback: children-traversal (used when parentNodeId given or direct search empty) ──
-        const level1 = await getChildCollections(env, startId, 100);
+        const level1 = await getChildCollections(startId, 100);
 
         if (!query) {
           return renderOut(level1, level1.length);
@@ -149,7 +147,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
 
         // Level-2 fallback: go one level deeper across all level-1 children
         const level2Results = await Promise.allSettled(
-          level1.map(parent => getChildCollections(env, parent.ref?.id ?? '', 50))
+          level1.map(parent => getChildCollections(parent.ref?.id ?? '', 50))
         );
         const allLevel2Nodes: import('./wlo-api.js').WloNode[] = [];
         for (const r of level2Results) {
@@ -178,7 +176,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
             : allLevel2Nodes.slice(0, 30);
 
           const level3Results = await Promise.allSettled(
-            level2Candidates.map(parent => getChildCollections(env, parent.ref?.id ?? '', 30))
+            level2Candidates.map(parent => getChildCollections(parent.ref?.id ?? '', 30))
           );
           for (const r of level3Results) {
             if (r.status === 'fulfilled') matches.push(...r.value.filter(n => matchesQuery(n, query)));
@@ -229,13 +227,8 @@ Filters accept both German labels and full URIs.`,
         'Skip these node IDs in the result (already-seen items)'
       ),
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
-      environment: z.enum(['production', 'staging']).optional().describe(
-        'WLO environment: "production" (default) or "staging"'
-      ),
     },
     async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
-      setFormatEnvironment(env);
       const filters = buildFilterCriteria(params);
       const maxResults = params.maxResults ?? 8;
       const excluded = new Set(params.excludeNodeIds ?? []);
@@ -247,12 +240,12 @@ Filters accept both German labels and full URIs.`,
         // the result list N items shorter without warning.
         const pool = excluded.size > 0 ? Math.min(maxResults + excluded.size, 20) : maxResults;
         if (params.query.trim()) {
-          response = await enhancedSearch(env, params.query, 'FILES', filters, pool);
+          response = await enhancedSearch(params.query, 'FILES', filters, pool);
         } else {
           const browseCriteria: SearchCriterion[] = filters.length
             ? filters
             : [{ property: 'ngsearchword', values: ['*'] }];
-          response = await ngsearch(env, browseCriteria, 'FILES', pool);
+          response = await ngsearch(browseCriteria, 'FILES', pool);
         }
 
         const kept = excluded.size
@@ -300,13 +293,8 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
         'Skip these node IDs in the result'
       ),
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
-      environment: z.enum(['production', 'staging']).optional().describe(
-        'WLO environment: "production" (default) or "staging"'
-      ),
     },
     async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
-      setFormatEnvironment(env);
       const filter = (params.contentFilter ?? 'files') as 'files' | 'folders' | 'both';
       const maxResults = params.maxResults ?? 20;
       const skipCount = params.skipCount ?? 0;
@@ -327,7 +315,7 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
             visited.add(cid);
 
             // Fetch files in this collection
-            const filesResp = await getCollectionContents(env, cid, 'files', 50);
+            const filesResp = await getCollectionContents(cid, 'files', 50);
             totalHits += filesResp.pagination.total;
             let fileNodes = filesResp.nodes;
             if (excluded.size) fileNodes = fileNodes.filter(n => !excluded.has(n.ref?.id ?? ''));
@@ -335,7 +323,7 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
             allNodes.push(...formatNodes(fileNodes));
 
             // Fetch sub-collections and queue them
-            const subs = await getChildCollections(env, cid);
+            const subs = await getChildCollections(cid);
             for (const sub of subs) {
               const subId = sub.ref?.id ?? sub.properties?.['sys:node-uuid']?.[0];
               if (subId && !visited.has(subId)) collectionQueue.push(subId);
@@ -343,7 +331,7 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
           }
           allNodes = allNodes.slice(0, maxResults);
         } else {
-          const response = await getCollectionContents(env, params.nodeId, filter, maxResults + excluded.size, skipCount);
+          const response = await getCollectionContents(params.nodeId, filter, maxResults + excluded.size, skipCount);
           totalHits = response.pagination.total;
           let nodes = response.nodes;
           if (excluded.size) nodes = nodes.filter(n => !excluded.has(n.ref?.id ?? ''));
@@ -392,16 +380,10 @@ Plus optional:
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown').describe(
         '"markdown" (default, human-readable) or "json" (structured data, easier to parse for callers)'
       ),
-      environment: z.enum(['production', 'staging']).optional().describe(
-        'WLO environment: "production" (default) or "staging"'
-      ),
     },
     async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
-      setFormatEnvironment(env);
-
       try {
-        const node = await getNodeMetadata(env, params.nodeId);
+        const node = await getNodeMetadata(params.nodeId);
         if (!node) {
           return { content: [{ type: 'text', text: `Node ${params.nodeId} nicht gefunden.` }] };
         }
@@ -410,9 +392,9 @@ Plus optional:
         const formatted = formatNode(node);
 
         // Extras that don't fit into FormattedNode
-        const renderUrl = `https://redaktion.openeduhub.net/edu-sharing/components/render/${params.nodeId}`;
-        const fullText = params.includeTextContent ? await getNodeTextContent(env, params.nodeId) : null;
-        const parents = params.includeParents ? await getNodeParents(env, params.nodeId) : [];
+        const renderUrl = buildRenderUrl(params.nodeId);
+        const fullText = params.includeTextContent ? await getNodeTextContent(params.nodeId) : null;
+        const parents = params.includeParents ? await getNodeParents(params.nodeId) : [];
 
         // ── JSON output ───────────────────────────────────────────────────
         if (params.outputFormat === 'json') {
@@ -587,12 +569,8 @@ Order: deterministic. By default sorted alphabetically by collection name with n
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown').describe(
         '"markdown" (default) or "json" (structured)'
       ),
-      environment: z.enum(['production', 'staging']).optional().describe(
-        'WLO environment: "production" (default) or "staging"'
-      ),
     },
     async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
       const tg = params.targetGroup as TargetGroup | undefined;
       const sort = params.sort ?? 'alpha';
       const merge = params.mergeVariants !== false;
@@ -602,18 +580,18 @@ Order: deterministic. By default sorted alphabetically by collection name with n
 
         // ── Mode A: Direct collection check ──────────────────────────────────
         if (params.collectionId) {
-          const pages = await getCollectionThemePages(env, params.collectionId, tg);
+          const pages = await getCollectionThemePages(params.collectionId, tg);
           results.push(...pages);
         }
         // ── Mode B: Topic-based search (collection → page_config_ref) ────────
         else if (params.query?.trim()) {
-          const collections = await searchCollectionsByKeyword(env, params.query, 10);
+          const collections = await searchCollectionsByKeyword(params.query, 10);
           for (const coll of collections) {
             const cId = coll.ref?.id;
             if (!cId) continue;
             const pageConfigRef = coll.properties?.['ccm:page_config_ref']?.[0];
             if (!pageConfigRef) continue;
-            const pages = await getCollectionThemePages(env, cId, tg);
+            const pages = await getCollectionThemePages(cId, tg);
             results.push(...pages);
             if (results.length >= (params.maxResults ?? 5) * 3) break;
           }
@@ -625,7 +603,7 @@ Order: deterministic. By default sorted alphabetically by collection name with n
             : undefined;
           // Fetch more variants than maxResults so the dedup/merge step still
           // has enough candidates after grouping by collection.
-          const variants = await searchPageVariants(env, {
+          const variants = await searchPageVariants({
             isTemplate: false,
             targetGroup: tg,
             educationalContext: eduCtxUri,
@@ -637,11 +615,11 @@ Order: deterministic. By default sorted alphabetically by collection name with n
             const vProps = v.properties ?? {};
             const variantId = v.ref?.id ?? '';
             if (!variantId) return null;
-            const owner = await resolveVariantCollection(env, variantId);
-            const ownerNode = owner ? await getNodeMetadata(env, owner.id) : null;
+            const owner = await resolveVariantCollection(variantId);
+            const ownerNode = owner ? await getNodeMetadata(owner.id) : null;
             const ownerProps = ownerNode?.properties ?? {};
             const pageConfigRef = ownerProps['ccm:page_config_ref']?.[0];
-            const topicPageUrl = owner ? buildTopicPageUrl(env, owner.id, pageConfigRef) ?? '' : '';
+            const topicPageUrl = owner ? buildTopicPageUrl(owner.id, pageConfigRef) ?? '' : '';
 
             return {
               variantId,
@@ -794,14 +772,10 @@ Themenseiten-URL, and the disciplines/educational contexts associated with the p
         'When true, also fetch the number of direct sub-collections per portal (extra round-trip).'
       ),
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
-      environment: z.enum(['production', 'staging']).optional(),
     },
     async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
-      setFormatEnvironment(env);
-
       try {
-        const portals = await getChildCollections(env, WLO_ROOT_COLLECTION_IDS[env], 100);
+        const portals = await getChildCollections(WLO_ROOT_COLLECTION_ID, 100);
 
         // Optional educational-context filter
         let filtered = portals;
@@ -825,7 +799,7 @@ Themenseiten-URL, and the disciplines/educational contexts associated with the p
           await Promise.allSettled(sorted.map(async p => {
             const id = p.ref?.id;
             if (!id) return;
-            const subs = await getChildCollections(env, id, 100);
+            const subs = await getChildCollections(id, 100);
             counts[id] = subs.length;
           }));
         }
@@ -888,15 +862,12 @@ choose a sub-area before fetching individual content items. Output is determinis
       ),
       maxResults: z.number().int().min(1).max(100).optional().default(50),
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
-      environment: z.enum(['production', 'staging']).optional(),
     },
     async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
-      setFormatEnvironment(env);
       const depth = params.depth ?? 1;
 
       try {
-        const level1 = await getChildCollections(env, params.nodeId, params.maxResults ?? 50);
+        const level1 = await getChildCollections(params.nodeId, params.maxResults ?? 50);
         const sorted1 = sortByTitle(level1);
 
         type TreeNode = ReturnType<typeof formatNode> & {
@@ -909,14 +880,14 @@ choose a sub-area before fetching individual content items. Output is determinis
           if (params.includeContentCounts) {
             const id = n.ref?.id;
             if (id) {
-              const filesResp = await getCollectionContents(env, id, 'files', 1, 0);
+              const filesResp = await getCollectionContents(id, 'files', 1, 0);
               f.fileCount = filesResp.pagination.total;
             }
           }
           if (depth === 2) {
             const id = n.ref?.id;
             if (id) {
-              const children = await getChildCollections(env, id, 30);
+              const children = await getChildCollections(id, 30);
               const sortedChildren = sortByTitle(children);
               f.children = await Promise.all(sortedChildren.map(c => enrichOne(c)));
             }
@@ -959,21 +930,18 @@ choose a sub-area before fetching individual content items. Output is determinis
     `Probe whether the WLO repository API is reachable and responding.
 Returns latency in ms, the resolved root collection nodeId, and a status flag.
 Useful for callers (e.g. chatbots) to quickly tell "WLO is down" from "your query produced no hits".`,
-    {
-      environment: z.enum(['production', 'staging']).optional(),
-    },
-    async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
+    {},
+    async () => {
       const t0 = Date.now();
       try {
-        const root = WLO_ROOT_COLLECTION_IDS[env];
-        const node = await getNodeMetadata(env, root);
+        const root = WLO_ROOT_COLLECTION_ID;
+        const node = await getNodeMetadata(root);
         const latencyMs = Date.now() - t0;
         const ok = node !== null;
         const payload = {
           ok,
-          environment: env,
-          baseUrl: BASE_URLS[env],
+          repositoryUrl: WLO_REPOSITORY_URL,
+          baseUrl: BASE_URL,
           rootNodeId: root,
           rootResolved: ok ? (node.properties?.['cclom:title']?.[0] ?? node.properties?.['cm:name']?.[0] ?? null) : null,
           latencyMs,
@@ -984,8 +952,8 @@ Useful for callers (e.g. chatbots) to quickly tell "WLO is down" from "your quer
         const msg = err instanceof Error ? err.message : String(err);
         const payload = {
           ok: false,
-          environment: env,
-          baseUrl: BASE_URLS[env],
+          repositoryUrl: WLO_REPOSITORY_URL,
+          baseUrl: BASE_URL,
           error: msg,
           latencyMs: Date.now() - t0,
           checkedAt: new Date().toISOString(),
@@ -1008,14 +976,10 @@ overall errors — so a single bad nodeId doesn't ruin the whole batch.`,
       nodeIds: z.array(z.string()).min(1).max(50).describe(
         'Array of node IDs to fetch (max 50 per call).'
       ),
-      environment: z.enum(['production', 'staging']).optional(),
     },
     async (params) => {
-      const env: WloEnvironment = params.environment ?? defaultEnv;
-      setFormatEnvironment(env);
-
       const ids = Array.from(new Set(params.nodeIds.filter(Boolean)));
-      const settled = await Promise.allSettled(ids.map(id => getNodeMetadata(env, id)));
+      const settled = await Promise.allSettled(ids.map(id => getNodeMetadata(id)));
       const results: Record<string, ReturnType<typeof formatNode>> = {};
       const failed: string[] = [];
       ids.forEach((id, i) => {

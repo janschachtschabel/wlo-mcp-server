@@ -49,6 +49,10 @@ Kompatibel mit **OpenAI** (Responses API + native MCP), **Anthropic Claude** und
 ### Entfernt (Breaking Changes)
 - `get_wirlernenonline_info`, `get_edu_sharing_network_info`, `get_edu_sharing_product_info`, `get_metaventis_info` — die Webseiten-Crawler-Tools sind weg. Diese Aufgabe übernimmt jetzt das Konsumenten-eigene RAG (z.B. das BadBoerdi-RAG).
 - Damit auch `WEB_CONTENT_WHITELIST` und `fetchWebContent()` aus `wlo-api.ts` entfernt.
+- **`environment`-Parameter aus allen Tool-Schemas entfernt.** Die Repository-Auswahl läuft jetzt **ausschließlich über die Env-Variable `WLO_REPOSITORY_URL`** (siehe „Umgebungsvariablen"). Pro Server-Instanz wird genau eine Edu-Sharing-Welt adressiert; Konsumenten zeigen ihren MCP-Client auf die jeweilige URL.
+- **`WLO_ENV` ist weg** — ersetzt durch `WLO_REPOSITORY_URL`. `WLO_ROOT_COLLECTION_IDS` (Record) wurde zu `WLO_ROOT_COLLECTION_ID` (eine Konstante, optional per Env überschreibbar).
+
+> **Backward-Kompatibilität für MCP-Clients:** Tool-Inputs werden mit Zod's Default-Mode (`.strip`) validiert — schickt ein alter Client den `environment`-Key trotzdem mit, **wird er silent ignoriert, ohne Crash**. Der Server antwortet aber immer mit den Daten der konfigurierten Repository-URL. Wer aktiv Staging-Daten wollte, muss seinen MCP-Client auf den Staging-Deployment-Endpoint umstellen (z.B. `https://wlo-mcp-server-staging.vercel.app/mcp`).
 
 ---
 
@@ -76,8 +80,11 @@ cp .env.example .env
 
 | Variable | Werte | Standard | Beschreibung |
 |---|---|---|---|
-| `WLO_ENV` | `production`, `staging` | `production` | Ziel-Umgebung der WLO-API |
+| `WLO_REPOSITORY_URL` | URL des Edu-Sharing-Frontend-Hosts (z.B. `https://redaktion.openeduhub.net/edu-sharing` oder `https://repository.staging.openeduhub.net/edu-sharing`) | WLO-Production | Edu-Sharing-Instanz, gegen die der Server arbeitet. Pfade sind in allen Instanzen identisch (`<base>/rest/...` für REST, `<base>/components/...` für Frontend) — daher reicht die Base-URL als Schalter zwischen Prod / Staging / eigenem Repository. **Eingabe-Toleranz:** Whitespace, Trailing-Slash(es) und ein angehängtes `/rest` werden automatisch entfernt; fehlendes Protokoll wird zu `https://` ergänzt. Bei verdächtigen Eingaben (deep links auf `/components/...`, doppeltes `/edu-sharing`) loggt der Server beim Start eine Warnung. |
+| `WLO_ROOT_COLLECTION_ID` | UUID | `5e40e372-735c-4b17-bbf7-e827a5702b57` | Wurzelknoten der Sammlungs-Hierarchie. Identisch auf WLO-Production und -Staging. Override nur nötig, wenn ein eigenständiges Repository mit anderem Root läuft. |
 | `PORT` | Zahl | `3000` | HTTP-Port (nur HTTP-Modus) |
+
+> **Ein Server = ein Repository.** Der MCP zeigt pro Prozess auf genau eine Edu-Sharing-Instanz. Wer parallel beide Welten anbieten will, deployt zwei Instanzen (z.B. zwei Vercel-Projekte mit unterschiedlichem `WLO_REPOSITORY_URL`).
 
 ### Server starten
 
@@ -133,7 +140,6 @@ Sucht thematische Sammlungen. Drei-stufige Strategie: Volltext-API → Baum-Trav
 | `maxResults` | int | `5` | 1–20 |
 | `excludeNodeIds` | string[] | – | Diese IDs in der Antwort überspringen |
 | `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
-| `environment` | enum | `production` | `"production"` oder `"staging"` |
 
 **API-Endpunkte:**
 ```
@@ -158,7 +164,6 @@ Globale Volltextsuche nach Bildungsmaterialien (Files). Mit **Multi-Query-Expans
 | `maxResults` | int | `8` | 1–20 |
 | `excludeNodeIds` | string[] | – | IDs überspringen |
 | `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
-| `environment` | enum | `production` | – |
 
 **Reranking-Pipeline:**
 1. **Query Expansion**: Volltext, Title-Match, Keyword-Hits, Synonym-Map, Einzelterme
@@ -184,7 +189,6 @@ Inhalte einer Sammlung. Unterstützt Pagination via `skipCount` und Filter.
 | `skipCount` | int | `0` | Pagination-Offset |
 | `excludeNodeIds` | string[] | – | IDs überspringen |
 | `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
-| `environment` | enum | `production` | – |
 
 > **Tipp:** Statt `contentFilter="folders"` ist `browse_collection_tree` (Tool 8) klarer und liefert direkt File-Counts.
 
@@ -201,7 +205,6 @@ Detail-Metadaten zu einem einzelnen Node (Content oder Sammlung).
 | `includeParents` | bool | `false` | Eltern-Sammlungen mitliefern |
 | `includeRaw` | bool | `false` | Zusätzlich die rohen URI-Werte (vor Label-Resolution) |
 | `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
-| `environment` | enum | `production` | – |
 
 **Output-Konsistenz**: Im JSON-Modus liefert `get_node_details` **dieselben Felder** wie ein Eintrag aus `search_wlo_*` (Output-Format `formatNode()`):
 ```json
@@ -288,7 +291,6 @@ Liefert die WLO-Fachportale — die **direkten Sub-Sammlungen unter dem Wurzel-K
 | `educationalContext` | string | – | Filter (Default: alle) |
 | `includeContentCounts` | bool | `false` | Zusätzlich `subCollectionCount` pro Portal |
 | `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
-| `environment` | enum | `production` | – |
 
 Output ist deterministisch alphabetisch (Tie-Breaker `nodeId`). Ideal als Einstiegspunkt für geführte Drilldowns.
 
@@ -317,17 +319,13 @@ Drilldown unter eine bestimmte Sammlung — Tiefe 1 (direkte Kinder) oder 2 (Enk
 
 ### 9. `wlo_health_check`
 
-Probe gegen die WLO-API.
-
-| Parameter | Typ | Default |
-|---|---|---|
-| `environment` | enum | `production` |
+Probe gegen die WLO-API. Nimmt keine Parameter — testet die durch `WLO_REPOSITORY_URL` konfigurierte Instanz.
 
 **Output (JSON):**
 ```json
 {
   "ok": true,
-  "environment": "production",
+  "repositoryUrl": "https://redaktion.openeduhub.net/edu-sharing",
   "baseUrl": "https://redaktion.openeduhub.net/edu-sharing/rest",
   "rootNodeId": "5e40e372-735c-…",
   "rootResolved": "Portale",
@@ -347,7 +345,6 @@ Bulk-Fetch für mehrere `nodeIds` (max. 50 / Aufruf, parallel).
 | Parameter | Typ | Default |
 |---|---|---|
 | `nodeIds` | string[] | **Pflicht** |
-| `environment` | enum | `production` |
 
 **Output:**
 ```json
@@ -503,16 +500,34 @@ Strukturierter JSON-String, optimal für Konsumenten, die Daten programmatisch w
 
 > Da die Web-Crawler-Tools entfernt sind, läuft v2 ohne Einschränkung auf **Vercel Hobby** (`maxDuration: 10s` reicht). Die `vercel.json` setzt trotzdem `maxDuration: 30` als Sicherheitspolster für `browse_collection_tree(depth=2, includeContentCounts=true)` bei breiten Bäumen.
 
+#### Production-Deploy
+
 1. Repo auf GitHub pushen
 2. Vercel → New Project → Repo importieren
-3. Environment Variable: `WLO_ENV=production`
+3. Environment Variable (optional, Default greift): `WLO_REPOSITORY_URL=https://redaktion.openeduhub.net/edu-sharing`
 4. Deploy → MCP-Endpoint: `https://dein-projekt.vercel.app/mcp`
+
+#### Staging-Deploy (zweite Instanz)
+
+Um parallel zur Production-Instanz eine Staging-Instanz zu betreiben, ein **zweites Vercel-Projekt** aus demselben Repo anlegen:
+
+1. Vercel → New Project → gleiches Repo, anderer Project Name (z.B. `wlo-mcp-server-staging`)
+2. Settings → Environment Variables → `WLO_REPOSITORY_URL=https://repository.staging.openeduhub.net/edu-sharing` setzen (überschreibt den Default aus `vercel.json`)
+3. Deploy → MCP-Endpoint: `https://wlo-mcp-server-staging.vercel.app/mcp`
+
+Konsumenten zeigen dann ihren MCP-Client je nach Welt auf die passende URL — kein Code-Switch im Konsumenten nötig.
 
 ### Option B: Docker
 
 ```bash
 docker build -t wlomcp .
-docker run -p 3000:3000 -e WLO_ENV=production wlomcp
+
+# Production
+docker run -p 3000:3000 wlomcp                                                      # nutzt Default
+docker run -p 3000:3000 -e WLO_REPOSITORY_URL=https://redaktion.openeduhub.net/edu-sharing wlomcp
+
+# Staging
+docker run -p 3000:3000 -e WLO_REPOSITORY_URL=https://repository.staging.openeduhub.net/edu-sharing wlomcp
 # → http://localhost:3000/mcp
 ```
 
@@ -521,7 +536,12 @@ docker run -p 3000:3000 -e WLO_ENV=production wlomcp
 ```bash
 npm install
 npm run build
+
+# Production (Default)
 node dist/http.js
+
+# Staging
+WLO_REPOSITORY_URL=https://repository.staging.openeduhub.net/edu-sharing node dist/http.js
 # → http://localhost:3000/mcp
 ```
 
@@ -567,11 +587,13 @@ response = client.beta.messages.create(
     "wlo": {
       "command": "node",
       "args": ["/pfad/zu/wlomcp/dist/stdio.js"],
-      "env": { "WLO_ENV": "production" }
+      "env": { "WLO_REPOSITORY_URL": "https://redaktion.openeduhub.net/edu-sharing" }
     }
   }
 }
 ```
+
+> Für eine Staging-Verbindung den Wert auf `https://repository.staging.openeduhub.net/edu-sharing` ändern (oder ein zweites Server-Profil hinzufügen).
 
 ---
 
@@ -618,10 +640,13 @@ wlomcp/
 
 **API-Basis-URLs:**
 
-| Umgebung | Base URL |
-|---|---|
-| Production | `https://redaktion.openeduhub.net/edu-sharing/rest` |
-| Staging | `https://repository.staging.openeduhub.net/edu-sharing/rest` |
+Die REST-API liegt unter `<WLO_REPOSITORY_URL>/rest/...`, das Frontend (Render- und Themenseiten-Links) unter `<WLO_REPOSITORY_URL>/components/...`. Die Pfade sind in allen Edu-Sharing-Instanzen identisch — der einzige Unterschied zwischen Welten ist die konfigurierte Repository-URL.
+
+| Welt | `WLO_REPOSITORY_URL` | Beispiel-Endpunkt (REST) |
+|---|---|---|
+| Production | `https://redaktion.openeduhub.net/edu-sharing` | `…/edu-sharing/rest/search/v1/…` |
+| Staging | `https://repository.staging.openeduhub.net/edu-sharing` | `…/edu-sharing/rest/search/v1/…` |
+| Custom | beliebige Edu-Sharing-Instanz | `<base>/rest/search/v1/…` |
 
 ---
 

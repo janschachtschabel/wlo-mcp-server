@@ -20,6 +20,6 @@
     }
   ],
   "env": {
-    "WLO_ENV": "production"
+    "WLO_REPOSITORY_URL": "https://redaktion.openeduhub.net/edu-sharing"
   }
 }

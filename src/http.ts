@@ -1,12 +1,14 @@
 /**
  * http.ts – HTTP server entry point (for Docker / self-hosted).
  * Implements MCP Streamable HTTP transport on POST /mcp.
- * Run: WLO_ENV=production PORT=3000 node dist/http.js
+ * Run: WLO_REPOSITORY_URL=https://redaktion.openeduhub.net/edu-sharing PORT=3000 \
+ *        node dist/http.js
  */
 
 import http from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createMcpServer } from './server.js';
+import { WLO_REPOSITORY_URL } from './wlo-api.js';
 
 const PORT = Number(process.env['PORT'] ?? 3000);
 
@@ -62,5 +64,5 @@ const httpServer = http.createServer(async (req, res) => {
 
 httpServer.listen(PORT, () => {
   console.log(`WLO MCP Server listening on http://localhost:${PORT}/mcp`);
-  console.log(`Environment: ${process.env['WLO_ENV'] ?? 'production'}`);
+  console.log(`Repository: ${WLO_REPOSITORY_URL}`);
 });

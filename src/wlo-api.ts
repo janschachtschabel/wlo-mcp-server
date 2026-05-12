@@ -1,20 +1,95 @@
 /**
  * wlo-api.ts – Minimal WLO / EduSharing API client
  * Targets the public REST API of WirLernenOnline.
+ *
+ * The server points at a single edu-sharing instance per process. Pick it
+ * via the ``WLO_REPOSITORY_URL`` env variable (e.g.
+ * ``https://redaktion.openeduhub.net/edu-sharing`` or
+ * ``https://repository.staging.openeduhub.net/edu-sharing``). The endpoint
+ * paths below (``/rest/search/v1/...``, ``/rest/node/v1/...``,
+ * ``/components/render/<id>``, ``/components/topic-pages?...``) are
+ * identical across instances, so the only difference between prod and
+ * staging is the base URL — which is exactly what this var encodes.
  */
 
-export type WloEnvironment = 'production' | 'staging';
+/**
+ * Sanitize a repository URL input. Forgives common user-typo cases:
+ *
+ *   - leading/trailing whitespace
+ *   - one or more trailing slashes
+ *   - a trailing ``/rest`` segment that users sometimes paste from the
+ *     REST docs (the MCP server appends ``/rest`` itself, so a double
+ *     ``/rest/rest`` would 404)
+ *   - missing protocol → defaults to ``https://``
+ *
+ * Returns the empty string for empty/whitespace-only input so the
+ * caller can decide whether to apply a default.
+ */
+export function sanitizeRepositoryUrl(raw: string): string {
+  let s = (raw ?? '').trim();
+  if (!s) return '';
+  // Strip one or more trailing slashes.
+  s = s.replace(/\/+$/, '');
+  // Common paste mistake: trailing /rest segment (which we add ourselves).
+  // ``\/rest$`` after slash-stripping covers both ``…/rest`` and ``…/rest/``.
+  s = s.replace(/\/rest$/i, '');
+  // Bare hostname → prepend https:// so the URL is parseable by fetch().
+  if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+  return s;
+}
 
-/** Central/root collection nodeId of the WLO repository. */
-export const WLO_ROOT_COLLECTION_IDS: Record<WloEnvironment, string> = {
-  production: '5e40e372-735c-4b17-bbf7-e827a5702b57',
-  staging:    '5e40e372-735c-4b17-bbf7-e827a5702b57',
-};
+/**
+ * Frontend base URL (e.g. ``https://redaktion.openeduhub.net/edu-sharing``).
+ * Resolved once from ``WLO_REPOSITORY_URL`` at module load; defaults to
+ * the WLO production redaction instance so unconfigured deploys still
+ * work as before. Logs a warning when the configured value looks
+ * suspicious (e.g. ends in ``/components`` or contains ``/edu-sharing``
+ * twice) — those are typically the result of pasting a deep link
+ * instead of the repository root.
+ */
+const _DEFAULT_REPOSITORY_URL = 'https://redaktion.openeduhub.net/edu-sharing';
+export const WLO_REPOSITORY_URL: string = (() => {
+  const raw = process.env['WLO_REPOSITORY_URL'] ?? '';
+  const cleaned = sanitizeRepositoryUrl(raw);
+  const resolved = cleaned || _DEFAULT_REPOSITORY_URL;
 
-export const BASE_URLS: Record<WloEnvironment, string> = {
-  production: 'https://redaktion.openeduhub.net/edu-sharing/rest',
-  staging:    'https://repository.staging.openeduhub.net/edu-sharing/rest',
-};
+  // Soft validation — warn but don't crash. We log to stderr so stdio
+  // transport users still see the warning even if stdout is reserved
+  // for MCP framing.
+  const suspicious: string[] = [];
+  if (/\/components($|\/)/i.test(resolved)) {
+    suspicious.push('URL ends in "/components" — looks like a deep page link, not the repository root');
+  }
+  // Lookahead (?=...) instead of capture-group so adjacent matches
+  // ("/edu-sharing/edu-sharing") are counted separately.
+  if ((resolved.match(/\/edu-sharing(?=\/|$)/gi)?.length ?? 0) > 1) {
+    suspicious.push('URL contains "/edu-sharing" more than once');
+  }
+  if (suspicious.length > 0) {
+    console.warn(
+      `[wlo-mcp] WLO_REPOSITORY_URL looks suspicious: ${suspicious.join('; ')}. ` +
+      `Resolved value: "${resolved}". ` +
+      `Expected format: "https://<host>/edu-sharing" (no trailing /rest, no /components).`,
+    );
+  }
+  return resolved;
+})();
+
+/** REST API base — ``<repository-url>/rest``. */
+export const BASE_URL: string = `${WLO_REPOSITORY_URL}/rest`;
+
+/**
+ * Central/root collection nodeId of the configured repository.
+ *
+ * Default is the WLO root (``5e40e372-...``) which is the same node ID
+ * on the staging mirror today. Override per deployment via
+ * ``WLO_ROOT_COLLECTION_ID`` if a future staging/development repo uses
+ * a different root.
+ */
+export const WLO_ROOT_COLLECTION_ID: string = (() => {
+  const raw = (process.env['WLO_ROOT_COLLECTION_ID'] ?? '').trim();
+  return raw || '5e40e372-735c-4b17-bbf7-e827a5702b57';
+})();
 
 export interface SearchCriterion {
   property: string;
@@ -61,26 +136,24 @@ const HEADERS = {
   'Content-Type': 'application/json',
 };
 
-const FRONTEND_BASE_URLS: Record<WloEnvironment, string> = {
-  production: 'https://redaktion.openeduhub.net/edu-sharing',
-  staging:    'https://repository.staging.openeduhub.net/edu-sharing',
-};
-
 /**
  * Build the topic-pages URL for a collection that has ccm:page_config_ref.
  * Returns null if pageConfigRef is falsy.
  */
 export function buildTopicPageUrl(
-  env: WloEnvironment,
   collectionId: string,
   pageConfigRef?: string | null,
 ): string | null {
   if (!pageConfigRef) return null;
-  return `${FRONTEND_BASE_URLS[env]}/components/topic-pages?collectionId=${collectionId}`;
+  return `${WLO_REPOSITORY_URL}/components/topic-pages?collectionId=${collectionId}`;
 }
 
-function base(env: WloEnvironment): string {
-  return BASE_URLS[env];
+/**
+ * Build the in-repo viewer URL (``/components/render/<id>``) for a node.
+ * Used by ``get_node_details`` to expose a stable permalink.
+ */
+export function buildRenderUrl(nodeId: string): string {
+  return `${WLO_REPOSITORY_URL}/components/render/${nodeId}`;
 }
 
 /**
@@ -92,7 +165,6 @@ function base(env: WloEnvironment): string {
 export type NgsearchContentType = 'FILES' | 'FILES_AND_FOLDERS';
 
 export async function ngsearch(
-  env: WloEnvironment,
   criteria: SearchCriterion[],
   contentType: NgsearchContentType = 'FILES',
   maxItems = 20,
@@ -105,7 +177,7 @@ export async function ngsearch(
     propertyFilter: '-all-',
   });
 
-  const url = `${base(env)}/search/v1/queries/-home-/mds_oeh/ngsearch?${params}`;
+  const url = `${BASE_URL}/search/v1/queries/-home-/mds_oeh/ngsearch?${params}`;
   const body = JSON.stringify({ criteria: criteria.map(c => ({ property: c.property, values: c.values })) });
 
   const res = await fetch(url, { method: 'POST', headers: HEADERS, body });
@@ -125,7 +197,6 @@ export async function ngsearch(
  * returns 0 for anonymous access, but filter=collections works.
  */
 export async function ngsearchCollections(
-  env: WloEnvironment,
   criteria: SearchCriterion[],
   maxItems = 20,
   skipCount = 0,
@@ -137,7 +208,7 @@ export async function ngsearchCollections(
     propertyFilter: '-all-',
   });
 
-  const url = `${base(env)}/search/v1/queries/-home-/mds_oeh/ngsearch?${params}`;
+  const url = `${BASE_URL}/search/v1/queries/-home-/mds_oeh/ngsearch?${params}`;
   const body = JSON.stringify({ criteria: criteria.map(c => ({ property: c.property, values: c.values })) });
 
   const res = await fetch(url, { method: 'POST', headers: HEADERS, body });
@@ -156,7 +227,6 @@ export async function ngsearchCollections(
  * Unlike ngsearch with filter=collections, this endpoint correctly returns ccm:map nodes.
  */
 export async function searchCollectionsByKeyword(
-  env: WloEnvironment,
   query: string,
   maxItems = 10,
 ): Promise<WloNode[]> {
@@ -166,7 +236,7 @@ export async function searchCollectionsByKeyword(
     skipCount: '0',
     propertyFilter: '-all-',
   });
-  const url = `${base(env)}/search/v1/queries/-home-/mds_oeh/collections?${params}`;
+  const url = `${BASE_URL}/search/v1/queries/-home-/mds_oeh/collections?${params}`;
   const body = JSON.stringify({ criteria: [{ property: 'ngsearchword', values: [query] }] });
   const res = await fetch(url, { method: 'POST', headers: HEADERS, body });
   if (!res.ok) return [];
@@ -179,7 +249,6 @@ export async function searchCollectionsByKeyword(
  * filter: 'files' → Inhalte, 'folders' → Sub-Sammlungen, undefined → beides
  */
 export async function getCollectionContents(
-  env: WloEnvironment,
   nodeId: string,
   filter: 'files' | 'folders' | 'both' = 'files',
   maxItems = 30,
@@ -192,7 +261,7 @@ export async function getCollectionContents(
   });
   if (filter !== 'both') params.set('filter', filter);
 
-  const url = `${base(env)}/node/v1/nodes/-home-/${nodeId}/children?${params}`;
+  const url = `${BASE_URL}/node/v1/nodes/-home-/${nodeId}/children?${params}`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) throw new Error(`getCollectionContents failed: ${res.status} ${res.statusText}`);
 
@@ -209,7 +278,6 @@ export async function getCollectionContents(
  * Same endpoint as getCollectionContents but with filter=folders.
  */
 export async function getChildCollections(
-  env: WloEnvironment,
   nodeId: string,
   maxItems = 100,
   skipCount = 0,
@@ -221,7 +289,7 @@ export async function getChildCollections(
     propertyFilter: '-all-',
   });
 
-  const url = `${base(env)}/node/v1/nodes/-home-/${nodeId}/children?${params}`;
+  const url = `${BASE_URL}/node/v1/nodes/-home-/${nodeId}/children?${params}`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) return [];
 
@@ -234,10 +302,9 @@ export async function getChildCollections(
  * Fetch metadata for a single node (FILE or COLLECTION).
  */
 export async function getNodeMetadata(
-  env: WloEnvironment,
   nodeId: string,
 ): Promise<WloNode | null> {
-  const url = `${base(env)}/node/v1/nodes/-home-/${nodeId}/metadata?propertyFilter=-all-`;
+  const url = `${BASE_URL}/node/v1/nodes/-home-/${nodeId}/metadata?propertyFilter=-all-`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) return null;
   const data = await res.json() as { node?: WloNode };
@@ -249,12 +316,11 @@ export async function getNodeMetadata(
  * Uses GET /node/v1/nodes/-home-/{id}/metadata per node.
  */
 export async function getCollectionMetadata(
-  env: WloEnvironment,
   nodeIds: string[],
 ): Promise<WloNode[]> {
   if (nodeIds.length === 0) return [];
   const settled = await Promise.allSettled(
-    nodeIds.map(id => getNodeMetadata(env, id))
+    nodeIds.map(id => getNodeMetadata(id))
   );
   return settled
     .filter((r): r is PromiseFulfilledResult<WloNode> => r.status === 'fulfilled' && r.value !== null)
@@ -266,10 +332,9 @@ export async function getCollectionMetadata(
  * Returns the stored full-text content of a node (web page text, PDF extract, etc.).
  */
 export async function getNodeTextContent(
-  env: WloEnvironment,
   nodeId: string,
 ): Promise<string | null> {
-  const url = `${base(env)}/node/v1/nodes/-home-/${nodeId}/textContent`;
+  const url = `${BASE_URL}/node/v1/nodes/-home-/${nodeId}/textContent`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) return null;
   const data = await res.json() as { content?: string; text?: string };
@@ -281,10 +346,9 @@ export async function getNodeTextContent(
  * Returns the parent nodes (collections) of a given node.
  */
 export async function getNodeParents(
-  env: WloEnvironment,
   nodeId: string,
 ): Promise<WloNode[]> {
-  const url = `${base(env)}/node/v1/nodes/-home-/${nodeId}/parents?propertyFilter=-all-`;
+  const url = `${BASE_URL}/node/v1/nodes/-home-/${nodeId}/parents?propertyFilter=-all-`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) return [];
   const data = await res.json() as { nodes?: WloNode[]; parents?: WloNode[] };
@@ -313,7 +377,6 @@ export interface ThemePageInfo {
  * Does NOT support full-text search (ngsearchword returns 0).
  */
 export async function searchPageVariants(
-  env: WloEnvironment,
   options: {
     isTemplate?: boolean;
     targetGroup?: TargetGroup;
@@ -345,7 +408,7 @@ export async function searchPageVariants(
     skipCount: '0',
     propertyFilter: '-all-',
   });
-  const url = `${base(env)}/search/v1/queries/-home-/mds_oeh/page_variant?${params}`;
+  const url = `${BASE_URL}/search/v1/queries/-home-/mds_oeh/page_variant?${params}`;
   const body = JSON.stringify({ criteria });
   const res = await fetch(url, { method: 'POST', headers: HEADERS, body });
   if (!res.ok) return [];
@@ -361,12 +424,11 @@ export async function searchPageVariants(
  * variants but don't yet know which collection each belongs to.
  */
 export async function resolveVariantCollection(
-  env: WloEnvironment,
   variantId: string,
 ): Promise<{ id: string; name: string } | null> {
   // 1) variant → its parent (page_config_node)
   const parentRes = await fetch(
-    `${base(env)}/node/v1/nodes/-home-/${variantId}/parents?propertyFilter=-all-`,
+    `${BASE_URL}/node/v1/nodes/-home-/${variantId}/parents?propertyFilter=-all-`,
     { headers: { Accept: 'application/json' } },
   );
   if (!parentRes.ok) return null;
@@ -385,7 +447,7 @@ export async function resolveVariantCollection(
     if (!pid) continue;
     // Walk one more level up
     const grandRes = await fetch(
-      `${base(env)}/node/v1/nodes/-home-/${pid}/parents?propertyFilter=-all-`,
+      `${BASE_URL}/node/v1/nodes/-home-/${pid}/parents?propertyFilter=-all-`,
       { headers: { Accept: 'application/json' } },
     );
     if (!grandRes.ok) continue;
@@ -410,11 +472,10 @@ export async function resolveVariantCollection(
  * Returns an array of ThemePageInfo with variant details.
  */
 export async function getCollectionThemePages(
-  env: WloEnvironment,
   collectionId: string,
   targetGroup?: TargetGroup,
 ): Promise<ThemePageInfo[]> {
-  const node = await getNodeMetadata(env, collectionId);
+  const node = await getNodeMetadata(collectionId);
   if (!node) return [];
 
   const props = node.properties ?? {};
@@ -425,17 +486,17 @@ export async function getCollectionThemePages(
   const configId = pageConfigRef.replace('workspace://SpacesStore/', '');
 
   // Config folder → children (page_config nodes) → their children (PAGE_VARIANT)
-  const configChildren = await getChildCollections(env, configId, 50);
+  const configChildren = await getChildCollections(configId, 50);
   const results: ThemePageInfo[] = [];
   const collectionName = props['cclom:title']?.[0] || props['cm:name']?.[0] || node.name || '';
-  const topicPageUrl = buildTopicPageUrl(env, collectionId, pageConfigRef) ?? '';
+  const topicPageUrl = buildTopicPageUrl(collectionId, pageConfigRef) ?? '';
 
   for (const configNode of configChildren) {
     const configNodeId = configNode.ref?.id;
     if (!configNodeId) continue;
 
     // Get variants (files) under each page_config
-    const variantResp = await getCollectionContents(env, configNodeId, 'both', 50);
+    const variantResp = await getCollectionContents(configNodeId, 'both', 50);
     for (const variant of variantResp.nodes) {
       const vProps = variant.properties ?? {};
       const isTemplate = vProps['ccm:page_variant_is_template']?.[0] === 'true';

@@ -2,7 +2,7 @@
  * formatter.ts – Extract and clean WLO node properties into a structured output.
  */
 
-import type { WloNode, WloEnvironment } from './wlo-api.js';
+import type { WloNode } from './wlo-api.js';
 import { buildTopicPageUrl } from './wlo-api.js';
 import { labelFromUri } from './vocabs.js';
 
@@ -130,9 +130,6 @@ function resolveLabels(
   );
 }
 
-let _formatEnv: WloEnvironment = 'production';
-export function setFormatEnvironment(env: WloEnvironment): void { _formatEnv = env; }
-
 export function formatNode(node: WloNode): FormattedNode {
   const p = node.properties ?? {};
   const nodeId = node.ref?.id ?? first(p['sys:node-uuid']);
@@ -158,7 +155,7 @@ export function formatNode(node: WloNode): FormattedNode {
     license:              labelFromUri(first(p['ccm:commonlicense_key']), 'license') || '',
     publisher:            first(p['ccm:oeh_publisher_combined']) || '',
     nodeType:             node.isDirectory === true ? 'collection' : 'content',
-    topicPageUrl:         buildTopicPageUrl(_formatEnv, nodeId, pageConfigRef) ?? '',
+    topicPageUrl:         buildTopicPageUrl(nodeId, pageConfigRef) ?? '',
   };
 }
 

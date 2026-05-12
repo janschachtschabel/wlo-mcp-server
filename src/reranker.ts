@@ -3,7 +3,7 @@
  * Ported from wlo-search-app/src/searchStrategy.ts + api.ts
  */
 
-import type { WloNode, SearchResponse, SearchCriterion, WloEnvironment, NgsearchContentType } from './wlo-api.js';
+import type { WloNode, SearchResponse, SearchCriterion, NgsearchContentType } from './wlo-api.js';
 import { ngsearch } from './wlo-api.js';
 
 // ── Query Expansion ──────────────────────────────────────────────────────────
@@ -232,7 +232,6 @@ function mergeAndRank(
 // ── Public: Enhanced search ──────────────────────────────────────────────────
 
 export async function enhancedSearch(
-  env: WloEnvironment,
   query: string,
   contentType: NgsearchContentType,
   additionalCriteria: SearchCriterion[],
@@ -243,7 +242,7 @@ export async function enhancedSearch(
   const settled = await Promise.allSettled(
     variants.map(async variant => {
       const criteria = [...variant.criteria, ...additionalCriteria];
-      const response = await ngsearch(env, criteria, contentType, POOL_SIZE);
+      const response = await ngsearch(criteria, contentType, POOL_SIZE);
       return { variant, response };
     })
   );
