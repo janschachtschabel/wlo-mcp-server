@@ -14,6 +14,21 @@ import { formatNodes, formatNode, renderToText, renderToJson } from './formatter
 import type { FormattedNode } from './formatter.js';
 import { resolveVocab, listVocab, labelFromUri, type VocabKey } from './vocabs.js';
 
+// ── Query metadata for downstream consumers (backend → frontend) ────────────
+
+export interface QueryMeta {
+  toolName: string;
+  queryType: string;
+  searchTerm: string;
+  criteria: Array<{ property: string; values: string[]; label?: string }>;
+  pagination: { maxItems: number; skipCount: number; totalResults: number };
+  repositoryUrl: string;
+}
+
+function queryMetaContent(meta: QueryMeta): { type: 'text'; text: string } {
+  return { type: 'text' as const, text: JSON.stringify({ _queryMeta: meta }) };
+}
+
 // ── Shared filter builder ────────────────────────────────────────────────────
 
 function buildFilterCriteria(params: {
@@ -108,8 +123,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         return words.some(w => haystack.includes(w));
       };
 
-      const renderOut = (nodes: WloNode[], total: number, emptyMsg = 'Keine Sammlungen gefunden.') => {
-        // Apply excludeNodeIds, then re-cap to maxResults.
+      const renderOut = (nodes: WloNode[], total: number, qType: string, emptyMsg = 'Keine Sammlungen gefunden.') => {
         const kept = excluded.size
           ? nodes.filter(n => !excluded.has(n.ref?.id ?? ''))
           : nodes;
@@ -117,35 +131,38 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         const text = (params.outputFormat ?? 'markdown') === 'json'
           ? renderToJson(formatted, total)
           : (renderToText(formatted, total) || emptyMsg);
-        return { content: [{ type: 'text' as const, text }] };
+        const meta = queryMetaContent({
+          toolName: 'search_wlo_collections',
+          queryType: qType,
+          searchTerm: params.query ?? '',
+          criteria: params.query?.trim()
+            ? [{ property: 'ngsearchword', values: [params.query] }]
+            : [],
+          pagination: { maxItems: maxResults, skipCount: 0, totalResults: total },
+          repositoryUrl: WLO_REPOSITORY_URL,
+        });
+        return { content: [{ type: 'text' as const, text }, meta] };
       };
 
       try {
         const query    = params.query.trim();
-        // Use parentNodeId if given, otherwise start from WLO root
         const startId  = params.parentNodeId ?? WLO_ROOT_COLLECTION_ID;
 
-        // ── Primary: full-text search via contentType=COLLECTIONS ─────────────
-        // Only use for root-level search (no parentNodeId) so guided traversal
-        // still works correctly when the client restricts to a subtree.
         if (query && !params.parentNodeId) {
           const directHits = await searchCollectionsByKeyword(query, maxResults);
           if (directHits.length > 0) {
-            return renderOut(directHits, directHits.length);
+            return renderOut(directHits, directHits.length, 'keyword_collections');
           }
         }
 
-        // ── Fallback: children-traversal (used when parentNodeId given or direct search empty) ──
         const level1 = await getChildCollections(startId, 100);
 
         if (!query) {
-          return renderOut(level1, level1.length);
+          return renderOut(level1, level1.length, 'collection_children');
         }
 
-        // Level-1: filter direct children by keyword
         let matches = level1.filter(n => matchesQuery(n, query));
 
-        // Level-2 fallback: go one level deeper across all level-1 children
         const level2Results = await Promise.allSettled(
           level1.map(parent => getChildCollections(parent.ref?.id ?? '', 50))
         );
@@ -158,8 +175,6 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         }
 
         if (matches.length === 0) {
-          // Level-3 fallback: sort Level-2 nodes by query-word relevance,
-          // then fetch children of the top 15 most relevant Level-2 nodes
           const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
           const scoreNode = (n: import('./wlo-api.js').WloNode): number => {
             const text = [
@@ -169,7 +184,6 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
             ].join(' ').toLowerCase();
             return queryWords.reduce((s, w) => s + (text.includes(w) ? 1 : 0), 0);
           };
-          // If any nodes score > 0, put them first; otherwise keep natural tree order
           const anyScored = allLevel2Nodes.some(n => scoreNode(n) > 0);
           const level2Candidates = anyScored
             ? [...allLevel2Nodes].sort((a, b) => scoreNode(b) - scoreNode(a)).slice(0, 30)
@@ -187,7 +201,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
           return { content: [{ type: 'text', text: `Keine Sammlungen gefunden für "${query}". Versuche einen übergeordneten Begriff (z.B. "Mathematik" statt "Bruchrechnung") oder frag nach verfügbaren Sammlungen ohne Suchbegriff.` }] };
         }
 
-        return renderOut(matches, matches.length);
+        return renderOut(matches, matches.length, 'collection_tree_traversal');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text', text: `Fehler bei der Sammlungssuche: ${msg}` }], isError: true };
@@ -235,17 +249,20 @@ Filters accept both German labels and full URIs.`,
 
       try {
         let response;
-        // Pull a slightly larger pool when excluding so the result still has
-        // enough entries after filtering — otherwise excludeNodeIds=N makes
-        // the result list N items shorter without warning.
+        let queryType: string;
+        let effectiveCriteria: SearchCriterion[];
         const pool = excluded.size > 0 ? Math.min(maxResults + excluded.size, 20) : maxResults;
         if (params.query.trim()) {
           response = await enhancedSearch(params.query, 'FILES', filters, pool);
+          queryType = 'ngsearch_enhanced';
+          effectiveCriteria = [{ property: 'ngsearchword', values: [params.query] }, ...filters];
         } else {
           const browseCriteria: SearchCriterion[] = filters.length
             ? filters
             : [{ property: 'ngsearchword', values: ['*'] }];
           response = await ngsearch(browseCriteria, 'FILES', pool);
+          queryType = 'ngsearch';
+          effectiveCriteria = browseCriteria;
         }
 
         const kept = excluded.size
@@ -255,7 +272,16 @@ Filters accept both German labels and full URIs.`,
         const text = (params.outputFormat ?? 'markdown') === 'json'
           ? renderToJson(formatted, response.pagination.total)
           : (renderToText(formatted, response.pagination.total) || 'Keine Inhalte gefunden.');
-        return { content: [{ type: 'text', text }] };
+
+        const meta = queryMetaContent({
+          toolName: 'search_wlo_content',
+          queryType,
+          searchTerm: params.query ?? '',
+          criteria: effectiveCriteria,
+          pagination: { maxItems: maxResults, skipCount: 0, totalResults: response.pagination.total },
+          repositoryUrl: WLO_REPOSITORY_URL,
+        });
+        return { content: [{ type: 'text', text }, meta] };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text', text: `Fehler bei der Inhaltssuche: ${msg}` }], isError: true };
@@ -344,7 +370,16 @@ or "both" for everything. Set includeSubcollections=true to traverse the full su
         const text = (params.outputFormat ?? 'markdown') === 'json'
           ? renderToJson(allNodes, totalHits)
           : (renderToText(allNodes, totalHits) || 'Sammlung ist leer oder nodeId nicht gefunden.');
-        return { content: [{ type: 'text', text }] };
+        const meta = queryMetaContent({
+          toolName: 'get_collection_contents',
+          queryType: params.includeSubcollections ? 'collection_children_recursive' : 'collection_children',
+          searchTerm: params.query ?? '',
+          criteria: [{ property: 'nodeId', values: [params.nodeId] },
+                     { property: 'contentFilter', values: [filter] }],
+          pagination: { maxItems: maxResults, skipCount, totalResults: totalHits },
+          repositoryUrl: WLO_REPOSITORY_URL,
+        });
+        return { content: [{ type: 'text', text }, meta] };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text', text: `Fehler beim Abruf der Sammlungsinhalte: ${msg}` }], isError: true };
@@ -574,17 +609,20 @@ Order: deterministic. By default sorted alphabetically by collection name with n
       const tg = params.targetGroup as TargetGroup | undefined;
       const sort = params.sort ?? 'alpha';
       const merge = params.mergeVariants !== false;
+      let queryType = 'topic_pages';
 
       try {
         const results: ThemePageInfo[] = [];
 
         // ── Mode A: Direct collection check ──────────────────────────────────
         if (params.collectionId) {
+          queryType = 'topic_pages_by_collection';
           const pages = await getCollectionThemePages(params.collectionId, tg);
           results.push(...pages);
         }
         // ── Mode B: Topic-based search (collection → page_config_ref) ────────
         else if (params.query?.trim()) {
+          queryType = 'topic_pages_by_keyword';
           const collections = await searchCollectionsByKeyword(params.query, 10);
           for (const coll of collections) {
             const cId = coll.ref?.id;
@@ -598,6 +636,7 @@ Order: deterministic. By default sorted alphabetically by collection name with n
         }
         // ── Mode C: List all Themenseiten (page_variant API) ─────────────────
         else {
+          queryType = 'page_variant';
           const eduCtxUri = params.educationalContext
             ? resolveVocab(params.educationalContext, 'educationalContext') ?? params.educationalContext
             : undefined;
@@ -707,6 +746,20 @@ Order: deterministic. By default sorted alphabetically by collection name with n
 
         const out = sortedKeys.slice(0, params.maxResults ?? 5).map(k => seen.get(k)!);
 
+        const tpCriteria: Array<{ property: string; values: string[] }> = [];
+        if (params.query?.trim()) tpCriteria.push({ property: 'ngsearchword', values: [params.query] });
+        if (params.collectionId) tpCriteria.push({ property: 'collectionId', values: [params.collectionId] });
+        if (params.targetGroup) tpCriteria.push({ property: 'targetGroup', values: [params.targetGroup] });
+        if (params.educationalContext) tpCriteria.push({ property: 'ccm:educationalcontext', values: [params.educationalContext] });
+        const tpMeta = queryMetaContent({
+          toolName: 'search_wlo_topic_pages',
+          queryType,
+          searchTerm: params.query ?? '',
+          criteria: tpCriteria,
+          pagination: { maxItems: params.maxResults ?? 5, skipCount: 0, totalResults: out.length },
+          repositoryUrl: WLO_REPOSITORY_URL,
+        });
+
         // ── JSON output ───────────────────────────────────────────────────
         if (params.outputFormat === 'json') {
           return {
@@ -716,7 +769,7 @@ Order: deterministic. By default sorted alphabetically by collection name with n
                 total: out.length,
                 results: out,
               }, null, 2),
-            }],
+            }, tpMeta],
           };
         }
 
@@ -730,7 +783,6 @@ Order: deterministic. By default sorted alphabetically by collection name with n
             parts.push(`Bildungsstufe: ${r.educationalContexts.join(', ')}`);
           }
           if (r.topicPageUrl) parts.push(`Themenseite: ${r.topicPageUrl}`);
-          // List variants (target groups). One line per variant.
           if (r.variants.length === 1) {
             parts.push(`Zielgruppe: ${r.variants[0].targetGroupLabel}`);
             parts.push(`Variante-ID: ${r.variants[0].variantId}`);
@@ -743,7 +795,7 @@ Order: deterministic. By default sorted alphabetically by collection name with n
           lines.push(parts.join('\n'));
           lines.push('');
         }
-        return { content: [{ type: 'text', text: lines.join('\n').trim() }] };
+        return { content: [{ type: 'text', text: lines.join('\n').trim() }, tpMeta] };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text', text: `Fehler bei der Themenseiten-Suche: ${msg}` }], isError: true };

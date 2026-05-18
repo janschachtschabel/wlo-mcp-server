@@ -35,6 +35,9 @@ export function sanitizeRepositoryUrl(raw: string): string {
   s = s.replace(/\/rest$/i, '');
   // Bare hostname → prepend https:// so the URL is parseable by fetch().
   if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+  // Auto-append /edu-sharing when only the bare host was given
+  // (e.g. "https://repository.staging.openeduhub.net").
+  if (!/\/edu-sharing(\/|$)/i.test(s)) s += '/edu-sharing';
   return s;
 }
 

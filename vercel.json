@@ -18,8 +18,5 @@
         { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Accept, Mcp-Session-Id" }
       ]
     }
-  ],
-  "env": {
-    "WLO_REPOSITORY_URL": "https://redaktion.openeduhub.net/edu-sharing"
-  }
+  ]
 }
