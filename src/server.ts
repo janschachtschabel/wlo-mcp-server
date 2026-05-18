@@ -16,17 +16,46 @@ import { resolveVocab, listVocab, labelFromUri, type VocabKey } from './vocabs.j
 
 // ── Query metadata for downstream consumers (backend → frontend) ────────────
 
+export interface LabeledCriterion {
+  property: string;
+  values: string[];
+  label?: string;
+}
+
 export interface QueryMeta {
   toolName: string;
   queryType: string;
   searchTerm: string;
-  criteria: Array<{ property: string; values: string[]; label?: string }>;
+  criteria: LabeledCriterion[];
   pagination: { maxItems: number; skipCount: number; totalResults: number };
   repositoryUrl: string;
+  searchUrl: string;
 }
 
-function queryMetaContent(meta: QueryMeta): { type: 'text'; text: string } {
-  return { type: 'text' as const, text: JSON.stringify({ _queryMeta: meta }) };
+const SEARCH_URL_FILTER_PROPS = new Set([
+  'ccm:taxonid',
+  'ccm:educationalcontext',
+  'ccm:oeh_lrt_aggregated',
+  'ccm:educationalintendedenduserrole',
+  'ccm:oeh_publisher_combined',
+]);
+
+function buildSearchUrl(repoUrl: string, searchTerm: string, criteria: LabeledCriterion[]): string {
+  const filterObj: Record<string, string[]> = {};
+  for (const c of criteria) {
+    if (SEARCH_URL_FILTER_PROPS.has(c.property)) {
+      filterObj[c.property] = c.values;
+    }
+  }
+  const params = new URLSearchParams();
+  if (searchTerm) params.set('q', searchTerm);
+  if (Object.keys(filterObj).length) params.set('filters', JSON.stringify(filterObj));
+  return `${repoUrl}/components/search?${params.toString()}`;
+}
+
+function queryMetaContent(meta: Omit<QueryMeta, 'searchUrl'>): { type: 'text'; text: string } {
+  const searchUrl = buildSearchUrl(meta.repositoryUrl, meta.searchTerm, meta.criteria);
+  return { type: 'text' as const, text: JSON.stringify({ _queryMeta: { ...meta, searchUrl } }) };
 }
 
 // ── Shared filter builder ────────────────────────────────────────────────────
@@ -37,28 +66,42 @@ function buildFilterCriteria(params: {
   userRole?: string;
   publisher?: string;
   learningResourceType?: string;
-}): SearchCriterion[] {
+}): { criteria: SearchCriterion[]; labeled: LabeledCriterion[] } {
   const criteria: SearchCriterion[] = [];
+  const labeled: LabeledCriterion[] = [];
 
   if (params.educationalContext) {
     const uri = resolveVocab(params.educationalContext, 'educationalContext');
-    if (uri) criteria.push({ property: 'ccm:educationalcontext', values: [uri] });
+    if (uri) {
+      criteria.push({ property: 'ccm:educationalcontext', values: [uri] });
+      labeled.push({ property: 'ccm:educationalcontext', values: [uri], label: params.educationalContext });
+    }
   }
   if (params.discipline) {
     const uri = resolveVocab(params.discipline, 'discipline');
-    if (uri) criteria.push({ property: 'ccm:taxonid', values: [uri] });
+    if (uri) {
+      criteria.push({ property: 'ccm:taxonid', values: [uri] });
+      labeled.push({ property: 'ccm:taxonid', values: [uri], label: params.discipline });
+    }
   }
   if (params.userRole) {
     const uri = resolveVocab(params.userRole, 'userRole');
-    if (uri) criteria.push({ property: 'ccm:educationalintendedenduserrole', values: [uri] });
+    if (uri) {
+      criteria.push({ property: 'ccm:educationalintendedenduserrole', values: [uri] });
+      labeled.push({ property: 'ccm:educationalintendedenduserrole', values: [uri], label: params.userRole });
+    }
   }
   if (params.publisher) {
     criteria.push({ property: 'ccm:oeh_publisher_combined', values: [params.publisher] });
+    labeled.push({ property: 'ccm:oeh_publisher_combined', values: [params.publisher], label: params.publisher });
   }
   const lrt = resolveVocab(params.learningResourceType ?? '', 'lrt');
-  if (lrt) criteria.push({ property: 'ccm:oeh_lrt_aggregated', values: [lrt] });
+  if (lrt) {
+    criteria.push({ property: 'ccm:oeh_lrt_aggregated', values: [lrt] });
+    labeled.push({ property: 'ccm:oeh_lrt_aggregated', values: [lrt], label: params.learningResourceType });
+  }
 
-  return criteria;
+  return { criteria, labeled };
 }
 
 // ── Factory ──────────────────────────────────────────────────────────────────
@@ -123,6 +166,20 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         return words.some(w => haystack.includes(w));
       };
 
+      const collLabeledCriteria: LabeledCriterion[] = [];
+      if (params.educationalContext) {
+        const uri = resolveVocab(params.educationalContext, 'educationalContext');
+        if (uri) collLabeledCriteria.push({ property: 'ccm:educationalcontext', values: [uri], label: params.educationalContext });
+      }
+      if (params.discipline) {
+        const uri = resolveVocab(params.discipline, 'discipline');
+        if (uri) collLabeledCriteria.push({ property: 'ccm:taxonid', values: [uri], label: params.discipline });
+      }
+      if (params.userRole) {
+        const uri = resolveVocab(params.userRole, 'userRole');
+        if (uri) collLabeledCriteria.push({ property: 'ccm:educationalintendedenduserrole', values: [uri], label: params.userRole });
+      }
+
       const renderOut = (nodes: WloNode[], total: number, qType: string, emptyMsg = 'Keine Sammlungen gefunden.') => {
         const kept = excluded.size
           ? nodes.filter(n => !excluded.has(n.ref?.id ?? ''))
@@ -131,13 +188,14 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         const text = (params.outputFormat ?? 'markdown') === 'json'
           ? renderToJson(formatted, total)
           : (renderToText(formatted, total) || emptyMsg);
+        const baseCriteria: LabeledCriterion[] = params.query?.trim()
+          ? [{ property: 'ngsearchword', values: [params.query] }]
+          : [];
         const meta = queryMetaContent({
           toolName: 'search_wlo_collections',
           queryType: qType,
           searchTerm: params.query ?? '',
-          criteria: params.query?.trim()
-            ? [{ property: 'ngsearchword', values: [params.query] }]
-            : [],
+          criteria: [...baseCriteria, ...collLabeledCriteria],
           pagination: { maxItems: maxResults, skipCount: 0, totalResults: total },
           repositoryUrl: WLO_REPOSITORY_URL,
         });
@@ -243,26 +301,28 @@ Filters accept both German labels and full URIs.`,
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown'),
     },
     async (params) => {
-      const filters = buildFilterCriteria(params);
+      const { criteria: filters, labeled: labeledFilters } = buildFilterCriteria(params);
       const maxResults = params.maxResults ?? 8;
       const excluded = new Set(params.excludeNodeIds ?? []);
 
       try {
         let response;
         let queryType: string;
-        let effectiveCriteria: SearchCriterion[];
+        let effectiveCriteria: LabeledCriterion[];
         const pool = excluded.size > 0 ? Math.min(maxResults + excluded.size, 20) : maxResults;
         if (params.query.trim()) {
           response = await enhancedSearch(params.query, 'FILES', filters, pool);
           queryType = 'ngsearch_enhanced';
-          effectiveCriteria = [{ property: 'ngsearchword', values: [params.query] }, ...filters];
+          effectiveCriteria = [{ property: 'ngsearchword', values: [params.query] }, ...labeledFilters];
         } else {
           const browseCriteria: SearchCriterion[] = filters.length
             ? filters
             : [{ property: 'ngsearchword', values: ['*'] }];
           response = await ngsearch(browseCriteria, 'FILES', pool);
           queryType = 'ngsearch';
-          effectiveCriteria = browseCriteria;
+          effectiveCriteria = labeledFilters.length
+            ? labeledFilters
+            : [{ property: 'ngsearchword', values: ['*'] }];
         }
 
         const kept = excluded.size
@@ -746,11 +806,17 @@ Order: deterministic. By default sorted alphabetically by collection name with n
 
         const out = sortedKeys.slice(0, params.maxResults ?? 5).map(k => seen.get(k)!);
 
-        const tpCriteria: Array<{ property: string; values: string[] }> = [];
+        const tpCriteria: LabeledCriterion[] = [];
         if (params.query?.trim()) tpCriteria.push({ property: 'ngsearchword', values: [params.query] });
         if (params.collectionId) tpCriteria.push({ property: 'collectionId', values: [params.collectionId] });
-        if (params.targetGroup) tpCriteria.push({ property: 'targetGroup', values: [params.targetGroup] });
-        if (params.educationalContext) tpCriteria.push({ property: 'ccm:educationalcontext', values: [params.educationalContext] });
+        if (params.targetGroup) {
+          const tgLabel = labelFromUri(params.targetGroup, 'targetGroup');
+          tpCriteria.push({ property: 'targetGroup', values: [params.targetGroup], label: tgLabel });
+        }
+        if (params.educationalContext) {
+          const eduUri = resolveVocab(params.educationalContext, 'educationalContext') ?? params.educationalContext;
+          tpCriteria.push({ property: 'ccm:educationalcontext', values: [eduUri], label: params.educationalContext });
+        }
         const tpMeta = queryMetaContent({
           toolName: 'search_wlo_topic_pages',
           queryType,
