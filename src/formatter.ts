@@ -146,7 +146,11 @@ export function formatNode(node: WloNode): FormattedNode {
     keywords:             p['cclom:general_keyword'] ?? [],
     disciplines:          resolveLabels(p['ccm:taxonid'],                    p['ccm:taxonid_DISPLAYNAME'],                    'discipline'),
     educationalContexts:  resolveLabels(p['ccm:educationalcontext'],         p['ccm:educationalcontext_DISPLAYNAME'],         'educationalContext'),
-    userRoles:            resolveLabels(p['ccm:oeh_intended_end_user_role'], p['ccm:oeh_intended_end_user_role_DISPLAYNAME'], 'userRole'),
+    // Intended end-user role lives in ccm:educationalintendedenduserrole
+    // (empirisch verifiziert gegen Staging — ccm:oeh_intended_end_user_role
+    // ist auf realen Knoten NIE gesetzt). Dieselbe Property wird auch beim
+    // Suchfilter verwendet (buildFilterCriteria), jetzt konsistent.
+    userRoles:            resolveLabels(p['ccm:educationalintendedenduserrole'], p['ccm:educationalintendedenduserrole_DISPLAYNAME'], 'userRole'),
     learningResourceTypes:resolveLabels(p['ccm:oeh_lrt_aggregated'],         p['ccm:oeh_lrt_aggregated_DISPLAYNAME'],         'lrt'),
     url:                  first(p['ccm:wwwurl']) || node.content?.url || '',
     downloadUrl:          node.downloadUrl ?? '',

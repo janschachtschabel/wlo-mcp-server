@@ -29,9 +29,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   }
 
   try {
+    // Normalize the Accept header so ANY client works — including simple ones
+    // (curl, MCP Inspector, some IDE integrations) that send only
+    // "application/json". The MCP SDK's POST handler hard-requires BOTH
+    // application/json AND text/event-stream (→ 406 otherwise); since we reply
+    // with a single JSON body (enableJsonResponse), forcing both is harmless.
+    // NOTE: the underlying @hono/node-server builds the Web Request from
+    // `rawHeaders` (not the parsed `headers` object), so we patch rawHeaders.
+    {
+      const WANT = 'application/json, text/event-stream';
+      const rh = req.rawHeaders;
+      let patched = false;
+      for (let i = 0; i < rh.length; i += 2) {
+        if (rh[i]?.toLowerCase() === 'accept') { rh[i + 1] = WANT; patched = true; }
+      }
+      if (!patched) rh.push('Accept', WANT);
+      req.headers['accept'] = WANT;
+    }
+
     const server    = createMcpServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless – required for Vercel serverless
+      enableJsonResponse: true,      // reply with one JSON body instead of an SSE
+                                     // stream — robust on serverless (no stream
+                                     // torn down by the immediate server.close()).
     });
 
     await server.connect(transport);

@@ -436,45 +436,60 @@ export async function searchPageVariants(
  */
 export async function resolveVariantCollection(
   variantId: string,
+  parentCache?: Map<string, { id: string; name: string } | null>,
+  knownParentId?: string,
 ): Promise<{ id: string; name: string } | null> {
-  // 1) variant → its parent (page_config_node)
-  const parentRes = await fetch(
-    `${BASE_URL}/node/v1/nodes/-home-/${variantId}/parents?propertyFilter=-all-`,
-    { headers: { Accept: 'application/json' } },
-  );
-  if (!parentRes.ok) return null;
-  const parentData = await parentRes.json() as { nodes?: WloNode[]; parents?: WloNode[] };
-  const parents = parentData.nodes ?? parentData.parents ?? [];
-  if (parents.length === 0) return null;
-
-  // 2) Walk up to find a node whose nodeId matches a collection's
-  //    `ccm:page_config_ref` value. We do this by going up one more level:
-  //    the page_config_node's parent is itself a config-folder; the
-  //    config-folder's id is what `ccm:page_config_ref` points to.
-  // Cheaper: take the page_config_node's parent's parent — it's the
-  // collection.
-  for (const p of parents) {
-    const pid = p.ref?.id;
-    if (!pid) continue;
-    // Walk one more level up
+  // Resolve ONE page_config parent → its owning collection (the node that
+  // carries `ccm:page_config_ref`). Memoized by parent-id: sibling variants
+  // of the same Themenseite share the same parent, so the (expensive) walk
+  // runs only once per parent across a whole Mode-C batch.
+  const resolveParent = async (pid: string): Promise<{ id: string; name: string } | null> => {
+    if (parentCache?.has(pid)) return parentCache.get(pid)!;
+    let result: { id: string; name: string } | null = null;
     const grandRes = await fetch(
       `${BASE_URL}/node/v1/nodes/-home-/${pid}/parents?propertyFilter=-all-`,
       { headers: { Accept: 'application/json' } },
     );
-    if (!grandRes.ok) continue;
-    const grandData = await grandRes.json() as { nodes?: WloNode[]; parents?: WloNode[] };
-    const grand = (grandData.nodes ?? grandData.parents ?? []);
-    for (const g of grand) {
-      const gprops = g.properties ?? {};
-      // The collection node has page_config_ref AND is_template/folder-y
-      if (gprops['ccm:page_config_ref']?.length) {
-        const name = gprops['cclom:title']?.[0] ?? gprops['cm:name']?.[0] ?? g.name ?? '';
-        const id = g.ref?.id ?? '';
-        if (id) return { id, name };
+    if (grandRes.ok) {
+      const grandData = await grandRes.json() as { nodes?: WloNode[]; parents?: WloNode[] };
+      for (const g of (grandData.nodes ?? grandData.parents ?? [])) {
+        const gprops = g.properties ?? {};
+        if (gprops['ccm:page_config_ref']?.length) {
+          const id = g.ref?.id ?? '';
+          if (id) {
+            result = { id, name: gprops['cclom:title']?.[0] ?? gprops['cm:name']?.[0] ?? g.name ?? '' };
+            break;
+          }
+        }
       }
     }
+    parentCache?.set(pid, result);
+    return result;
+  };
+
+  // Determine which parent(s) to resolve. A page variant lives under exactly
+  // one page_config folder, so its known primary parent
+  // (virtual:primaryparent_nodeid, present on every page_variant search hit)
+  // is authoritative — use it directly and skip the variant→parents round-
+  // trip entirely. We only fetch the parents list when no parent is known.
+  let pids: string[];
+  if (knownParentId) {
+    pids = [knownParentId];
+  } else {
+    const parentRes = await fetch(
+      `${BASE_URL}/node/v1/nodes/-home-/${variantId}/parents?propertyFilter=-all-`,
+      { headers: { Accept: 'application/json' } },
+    );
+    if (!parentRes.ok) return null;
+    const parentData = await parentRes.json() as { nodes?: WloNode[]; parents?: WloNode[] };
+    pids = (parentData.nodes ?? parentData.parents ?? [])
+      .map(p => p.ref?.id)
+      .filter((x): x is string => !!x);
   }
-  return null;
+  if (pids.length === 0) return null;
+  // Parents resolved in parallel (usually one), each memoized by parent-id.
+  const resolved = await Promise.all(pids.map(resolveParent));
+  return resolved.find(r => r !== null) ?? null;
 }
 
 /**
@@ -532,5 +547,120 @@ export async function getCollectionThemePages(
     }
   }
   return results;
+}
+
+// ── Theme page CONTENT (swimlane structure) ───────────────────────────────────
+
+/** One item inside a swimlane: a widget plus the optional embedded node it shows. */
+export interface SwimlaneItem {
+  /** Widget type, e.g. "content-teaser", "ai-text", "wlo-collection-chips". */
+  widget: string;
+  /** Embedded content/collection nodeId (bare UUID), if the widget references one. */
+  nodeId?: string;
+}
+
+/** One section of a Themenseite. */
+export interface Swimlane {
+  heading: string;
+  /** Layout type, e.g. "container" or "accordion". */
+  type: string;
+  items: SwimlaneItem[];
+}
+
+/** Parsed content structure of a single page variant. */
+export interface TopicPageStructure {
+  collectionId?: string;
+  variantId: string;
+  variantTitle: string;
+  swimlanes: Swimlane[];
+  /** Flat, de-duplicated list of every embedded nodeId across all swimlanes. */
+  referencedNodeIds: string[];
+}
+
+function stripStoreRef(s: string | undefined): string {
+  return (s ?? '').replace('workspace://SpacesStore/', '');
+}
+
+/** Parse a ``ccm:page_variant_config`` JSON string into ordered swimlanes. */
+function parsePageVariantConfig(raw: string | undefined): Swimlane[] {
+  if (!raw) return [];
+  let parsed: any;
+  try { parsed = JSON.parse(raw); } catch { return []; }
+  const swimlanes = parsed?.structure?.swimlanes;
+  if (!Array.isArray(swimlanes)) return [];
+  return swimlanes.map((sl: any): Swimlane => {
+    const grid = Array.isArray(sl?.grid) ? sl.grid : [];
+    const items: SwimlaneItem[] = grid
+      .map((g: any): SwimlaneItem => ({
+        widget: typeof g?.item === 'string' ? g.item : '',
+        nodeId: g?.nodeId ? stripStoreRef(String(g.nodeId)) : undefined,
+      }))
+      .filter((it: SwimlaneItem) => it.widget || it.nodeId);
+    return {
+      heading: typeof sl?.heading === 'string' ? sl.heading : '',
+      type: typeof sl?.type === 'string' ? sl.type : '',
+      items,
+    };
+  });
+}
+
+/**
+ * Resolve the CONTENT STRUCTURE of a Themenseite — its swimlane sections plus
+ * the node IDs embedded in each. Pass a ``variantId`` directly (fast: one
+ * fetch) or a ``collectionId`` (resolves the owning collection's page config
+ * to a variant). ``targetGroup`` picks a specific variant when resolving by
+ * collection. Returns null when nothing resolvable.
+ */
+export async function getTopicPageContent(
+  opts: { collectionId?: string; variantId?: string; targetGroup?: TargetGroup },
+): Promise<TopicPageStructure | null> {
+  const seedId = opts.variantId || opts.collectionId;
+  if (!seedId) return null;
+
+  // Fetch the seed node. It may already be the page variant itself (carries
+  // ccm:page_variant_config) or the owning collection (carries
+  // ccm:page_config_ref pointing at the config folder). Handling both makes
+  // the tool robust regardless of which id the caller passes.
+  let variantNode: WloNode | null = await getNodeMetadata(seedId);
+  const hasVariantConfig = (n: WloNode | null) => !!n?.properties?.['ccm:page_variant_config']?.[0];
+
+  if (variantNode && !hasVariantConfig(variantNode)) {
+    const ref = variantNode.properties?.['ccm:page_config_ref']?.[0];
+    if (!ref) return null;
+    const configChildren = await getChildCollections(stripStoreRef(ref), 50);
+    let picked: WloNode | null = null;
+    for (const cn of configChildren) {
+      const cnId = cn.ref?.id;
+      if (!cnId) continue;
+      const vr = await getCollectionContents(cnId, 'both', 50);
+      const candidates = vr.nodes.filter(
+        n => n.properties?.['ccm:page_variant_is_template']?.[0] !== 'true',
+      );
+      const pick = opts.targetGroup
+        ? candidates.find(
+            n => n.properties?.['ccm:page_variant_profiling_target_group']?.[0] === opts.targetGroup,
+          )
+        : candidates[0];
+      if (pick) { picked = pick; break; }
+    }
+    variantNode = picked;
+  }
+
+  if (!variantNode) return null;
+
+  const vProps = variantNode.properties ?? {};
+  const swimlanes = parsePageVariantConfig(vProps['ccm:page_variant_config']?.[0]);
+  const referencedNodeIds = [
+    ...new Set(
+      swimlanes.flatMap(s => s.items.map(i => i.nodeId).filter((x): x is string => !!x)),
+    ),
+  ];
+  return {
+    collectionId: opts.collectionId,
+    variantId: variantNode.ref?.id ?? opts.variantId ?? '',
+    variantTitle: vProps['cclom:title']?.[0] || vProps['cm:title']?.[0] || '',
+    swimlanes,
+    referencedNodeIds,
+  };
 }
 

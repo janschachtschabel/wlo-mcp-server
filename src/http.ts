@@ -47,9 +47,27 @@ const httpServer = http.createServer(async (req, res) => {
       return;
     }
 
+    // Normalize Accept so ANY client works (incl. simple JSON-only clients like
+    // curl or some IDE integrations). The MCP SDK hard-requires BOTH
+    // application/json AND text/event-stream on POST (→ 406 otherwise); with
+    // enableJsonResponse we always reply with a single JSON body, so forcing
+    // both here is harmless. NOTE: @hono/node-server builds the Web Request from
+    // `rawHeaders` (not the parsed `headers` object), so we patch rawHeaders.
+    {
+      const WANT = 'application/json, text/event-stream';
+      const rh = req.rawHeaders;
+      let patched = false;
+      for (let i = 0; i < rh.length; i += 2) {
+        if (rh[i]?.toLowerCase() === 'accept') { rh[i + 1] = WANT; patched = true; }
+      }
+      if (!patched) rh.push('Accept', WANT);
+      req.headers['accept'] = WANT;
+    }
+
     const server    = createMcpServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless
+      enableJsonResponse: true,      // single JSON body instead of an SSE stream
     });
 
     await server.connect(transport);

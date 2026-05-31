@@ -7,7 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type { SearchCriterion } from './wlo-api.js';
-import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, WLO_ROOT_COLLECTION_ID, searchPageVariants, getCollectionThemePages, buildTopicPageUrl, buildRenderUrl, BASE_URL, WLO_REPOSITORY_URL, resolveVariantCollection } from './wlo-api.js';
+import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, WLO_ROOT_COLLECTION_ID, searchPageVariants, getCollectionThemePages, getTopicPageContent, buildTopicPageUrl, buildRenderUrl, BASE_URL, WLO_REPOSITORY_URL, resolveVariantCollection } from './wlo-api.js';
 import type { TargetGroup, ThemePageInfo, WloNode } from './wlo-api.js';
 import { enhancedSearch, rerankNodes, sortByTitle } from './reranker.js';
 import { formatNodes, formatNode, renderToText, renderToJson } from './formatter.js';
@@ -46,6 +46,33 @@ function pickThemePageTitle(r: ThemePageInfo): string {
     if (t && !isPlaceholderTitle(t)) return t;
   }
   return 'Themenseite';
+}
+
+/**
+ * Run an async mapper over `items` with a bounded number of concurrent
+ * in-flight tasks (worker-pool). Keeps result order. Used to fan out the
+ * per-variant enrichment in search_wlo_topic_pages Mode C WITHOUT firing
+ * 100+ simultaneous upstream fetches (which risks connection exhaustion /
+ * upstream throttling / the 30s Vercel limit) — a controlled pool is both
+ * stable and, combined with caching, fast.
+ */
+async function mapPool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) break;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  const n = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: n }, worker));
+  return results;
 }
 
 // ── Query metadata for downstream consumers (backend → frontend) ────────────
@@ -175,7 +202,7 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
       userRole: z.string().optional().describe(
         'Target audience (Zielgruppe): e.g. "Lehrer/in", "Lerner/in", "Eltern", or URI'
       ),
-      maxResults: z.number().int().min(1).max(20).optional().default(5).describe(
+      maxResults: z.number().int().min(1).max(50).optional().default(5).describe(
         'Maximum number of results (1–20, default 5)'
       ),
       excludeNodeIds: z.array(z.string()).optional().describe(
@@ -326,7 +353,7 @@ Filters accept both German labels and full URIs.`,
         'Filter by content publisher/source, e.g. "Klexikon", "ZUM", "Serlo", "Khan Academy". ' +
         'Matches against the ccm:oeh_publisher_combined property.'
       ),
-      maxResults: z.number().int().min(1).max(20).optional().default(8).describe(
+      maxResults: z.number().int().min(1).max(50).optional().default(8).describe(
         'Maximum number of results (1–20, default 8)'
       ),
       excludeNodeIds: z.array(z.string()).optional().describe(
@@ -546,7 +573,7 @@ Plus optional:
             payload['raw'] = {
               disciplines: props['ccm:taxonid'] ?? [],
               educationalContexts: props['ccm:educationalcontext'] ?? [],
-              userRoles: props['ccm:oeh_intended_end_user_role'] ?? [],
+              userRoles: props['ccm:educationalintendedenduserrole'] ?? [],
               learningResourceTypes: props['ccm:oeh_lrt_aggregated'] ?? [],
               license: props['ccm:commonlicense_key']?.[0] ?? '',
             };
@@ -743,14 +770,27 @@ Order: deterministic. By default sorted alphabetically by collection name with n
             educationalContext: eduCtxUri,
           }, Math.max(50, (params.maxResults ?? 5) * 5));
 
-          // Resolve owning collections in parallel so the result has
-          // human-readable titles instead of "PAGE_VARIANT_xxx".
-          const enriched = await Promise.allSettled(variants.map(async (v) => {
+          // Resolve owning collections so each result has a human-readable
+          // title. Perf: a per-batch cache dedupes the owner-resolution and
+          // owner-metadata fetches across sibling variants of the same
+          // Themenseite; the variant's known primary parent
+          // (virtual:primaryparent_nodeid) skips a round-trip; and a bounded
+          // pool caps concurrent upstream fetches.
+          const parentCache = new Map<string, { id: string; name: string } | null>();
+          const ownerMetaCache = new Map<string, Promise<WloNode | null>>();
+          const stripWs = (s?: string) => (s ?? '').replace('workspace://SpacesStore/', '');
+
+          const enriched = await mapPool(variants, 10, async (v) => {
             const vProps = v.properties ?? {};
             const variantId = v.ref?.id ?? '';
             if (!variantId) return null;
-            const owner = await resolveVariantCollection(variantId);
-            const ownerNode = owner ? await getNodeMetadata(owner.id) : null;
+            const knownParentId = stripWs(vProps['virtual:primaryparent_nodeid']?.[0]) || undefined;
+            const owner = await resolveVariantCollection(variantId, parentCache, knownParentId);
+            let ownerNode: WloNode | null = null;
+            if (owner) {
+              if (!ownerMetaCache.has(owner.id)) ownerMetaCache.set(owner.id, getNodeMetadata(owner.id));
+              ownerNode = await ownerMetaCache.get(owner.id)!;
+            }
             const ownerProps = ownerNode?.properties ?? {};
             const pageConfigRef = ownerProps['ccm:page_config_ref']?.[0];
             const topicPageUrl = owner ? buildTopicPageUrl(owner.id, pageConfigRef) ?? '' : '';
@@ -766,10 +806,10 @@ Order: deterministic. By default sorted alphabetically by collection name with n
               collectionId: owner?.id,
               collectionName: owner?.name,
             } satisfies ThemePageInfo;
-          }));
+          });
 
           for (const r of enriched) {
-            if (r.status === 'fulfilled' && r.value) results.push(r.value);
+            if (r) results.push(r);
           }
         }
 
@@ -1158,6 +1198,71 @@ overall errors — so a single bad nodeId doesn't ruin the whole batch.`,
           }, null, 2),
         }],
       };
+    },
+  );
+
+  // ── Tool 12: get_topic_page_content ──────────────────────────────────────────
+  server.tool(
+    'get_topic_page_content',
+    `Get the CONTENT STRUCTURE of a Themenseite (topic page): its sections
+(swimlanes) — each with a heading and the nodeIds of the materials/collections
+embedded in it. Use this AFTER search_wlo_topic_pages to see what is actually ON
+a topic page (search_wlo_topic_pages only returns its URL). Resolve the returned
+nodeIds to human titles with get_nodes_details.
+
+Provide EITHER variantId (a "Variante-ID" from search_wlo_topic_pages — fastest)
+OR collectionId (a "Sammlung-nodeId"). At least one is required.`,
+    {
+      collectionId: z.string().optional().describe(
+        'Owning collection nodeId of the Themenseite (the "Sammlung-nodeId" from search_wlo_topic_pages).'
+      ),
+      variantId: z.string().optional().describe(
+        'A specific page-variant nodeId (the "Variante-ID" from search_wlo_topic_pages). Faster than collectionId.'
+      ),
+      targetGroup: z.enum(['teacher', 'learner', 'general']).optional().describe(
+        'When resolving by collectionId, pick the variant for this target group.'
+      ),
+      outputFormat: z.enum(['markdown', 'json']).optional().default('markdown').describe(
+        '"markdown" (default) or "json" (structured: swimlanes[] + referencedNodeIds[])'
+      ),
+    },
+    async (params) => {
+      try {
+        if (!params.collectionId && !params.variantId) {
+          return { content: [{ type: 'text', text: 'Bitte collectionId oder variantId angeben.' }], isError: true };
+        }
+        const struct = await getTopicPageContent({
+          collectionId: params.collectionId,
+          variantId: params.variantId,
+          targetGroup: params.targetGroup as TargetGroup | undefined,
+        });
+        if (!struct || struct.swimlanes.length === 0) {
+          return { content: [{ type: 'text', text: 'Keine Themenseiten-Inhaltsstruktur gefunden (keine Variante oder leere Konfiguration).' }] };
+        }
+
+        if (params.outputFormat === 'json') {
+          return { content: [{ type: 'text', text: JSON.stringify(struct, null, 2) }] };
+        }
+
+        const lines: string[] = [];
+        if (struct.variantTitle) lines.push(`# ${struct.variantTitle}`);
+        lines.push(`Abschnitte (Swimlanes): ${struct.swimlanes.length}`);
+        lines.push('');
+        struct.swimlanes.forEach((sl, i) => {
+          lines.push(`## ${i + 1}. ${sl.heading || '(ohne Überschrift)'}${sl.type ? ` [${sl.type}]` : ''}`);
+          for (const it of sl.items) {
+            lines.push(`  - ${it.widget || 'widget'}${it.nodeId ? ` → nodeId: ${it.nodeId}` : ''}`);
+          }
+        });
+        if (struct.referencedNodeIds.length) {
+          lines.push('');
+          lines.push(`Eingebettete nodeIds (${struct.referencedNodeIds.length}): ${struct.referencedNodeIds.join(', ')}`);
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: 'text', text: `Fehler beim Abruf des Themenseiten-Inhalts: ${msg}` }], isError: true };
+      }
     },
   );
 
