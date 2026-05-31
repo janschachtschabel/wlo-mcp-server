@@ -365,6 +365,14 @@ export type TargetGroup = 'teacher' | 'learner' | 'general';
 export interface ThemePageInfo {
   variantId: string;
   variantName: string;
+  /**
+   * Human-readable title of the page-variant node itself (`cm:title`,
+   * e.g. "Seiten-Variante 1"). Distinct from `variantName`, which holds
+   * the auto-generated technical `cm:name` ("PAGE_VARIANT_<uuid>").
+   * Used as a display fallback when the owning collection can't be
+   * resolved, so the UI never shows the raw PAGE_VARIANT/UUID string.
+   */
+  variantTitle?: string;
   targetGroup: string;
   educationalContexts: string[];
   isTemplate: boolean;
@@ -513,6 +521,7 @@ export async function getCollectionThemePages(
       results.push({
         variantId: variant.ref?.id ?? '',
         variantName: vProps['cm:name']?.[0] || variant.name || '',
+        variantTitle: vProps['cclom:title']?.[0] || vProps['cm:title']?.[0] || '',
         targetGroup: vTargetGroup || 'nicht gesetzt',
         educationalContexts: eduContexts,
         isTemplate: false,

@@ -72,9 +72,14 @@ function expandQuery(query: string): QueryVariant[] {
   const queryLower = trimmed.toLowerCase();
   const synonymQueries = new Set<string>();
   for (const [term, synonyms] of Object.entries(SYNONYM_MAP)) {
-    if (queryLower.includes(term)) {
+    // Match on word boundaries (umlaut-aware) so a key like "klima" does NOT
+    // fire inside "klimawandel", and the replace can't corrupt a substring
+    // (the old `.replace(term, syn)` turned "geographie" → "geographiegrafie").
+    const esc = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<![\\wäöüß])${esc}(?![\\wäöüß])`, 'i');
+    if (re.test(queryLower)) {
       for (const syn of synonyms) {
-        const expanded = queryLower.replace(term, syn);
+        const expanded = queryLower.replace(re, syn);
         if (expanded !== queryLower) synonymQueries.add(expanded);
       }
     }
@@ -226,7 +231,13 @@ function mergeAndRank(
 
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
   const minScore   = Math.max(5, queryTerms.length * 3);
-  return entries.filter(e => e.qualityScore >= minScore);
+  const passing = entries.filter(e => e.qualityScore >= minScore);
+  // Graceful degradation: if the text-overlap quality floor would discard
+  // EVERY hit (e.g. the backend matched via full-text/PDF body or keywords
+  // not echoed in cclom:title/general_keyword), fall back to the RRF-ranked
+  // pool instead of returning nothing. `entries` is already sorted by
+  // finalScore, so the best candidates stay on top.
+  return passing.length > 0 ? passing : entries;
 }
 
 // ── Public: Enhanced search ──────────────────────────────────────────────────
@@ -256,11 +267,18 @@ export async function enhancedSearch(
   const ranked   = mergeAndRank(successful, query);
   const filtered = ranked.filter(r => !isDeletedNode(r.node));
   const topNodes = filtered.slice(0, maxResults).map(r => r.node);
-  const apiTotal = Math.max(...successful.map(r => r.response.pagination.total), 0);
+  // Report the TRUE backend hit count of the primary full-query variant
+  // (label "full:…") as the total. Previously this was clamped to
+  // filtered.length (≤ POOL_SIZE = 40), badly under-reporting "found N" for
+  // broad queries. `count` stays the number actually returned this page.
+  const fullVariant = successful.find(r => r.variant.label.startsWith('full:'));
+  const apiTotal = fullVariant
+    ? fullVariant.response.pagination.total
+    : Math.max(...successful.map(r => r.response.pagination.total), 0);
 
   return {
     nodes: topNodes,
-    pagination: { total: Math.min(apiTotal, filtered.length), from: 0, count: topNodes.length },
+    pagination: { total: apiTotal, from: 0, count: topNodes.length },
   };
 }
 

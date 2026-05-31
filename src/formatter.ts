@@ -137,7 +137,11 @@ export function formatNode(node: WloNode): FormattedNode {
 
   return {
     nodeId,
-    title:                first(p['cclom:title']) || first(p['cm:name']) || node.name || node.title || '',
+    // cm:title vor cm:name: bei Page-Variant-Knoten ist cm:name ein
+    // technischer Platzhalter ("PAGE_VARIANT_<uuid>"), der lesbare Titel
+    // steckt in cm:title. So leakt kein Platzhalter über get_node_details /
+    // get_nodes_details / get_collection_contents / browse_collection_tree.
+    title:                first(p['cclom:title']) || first(p['cm:title']) || first(p['cm:name']) || node.name || node.title || '',
     description:          first(p['cclom:general_description']) || node.collection?.description || '',
     keywords:             p['cclom:general_keyword'] ?? [],
     disciplines:          resolveLabels(p['ccm:taxonid'],                    p['ccm:taxonid_DISPLAYNAME'],                    'discipline'),
@@ -154,7 +158,7 @@ export function formatNode(node: WloNode): FormattedNode {
     // Licenses don't have a server-side _DISPLAYNAME — keep local map.
     license:              labelFromUri(first(p['ccm:commonlicense_key']), 'license') || '',
     publisher:            first(p['ccm:oeh_publisher_combined']) || '',
-    nodeType:             node.isDirectory === true ? 'collection' : 'content',
+    nodeType:             (node.type === 'ccm:map' || node.isDirectory === true) ? 'collection' : 'content',
     topicPageUrl:         buildTopicPageUrl(nodeId, pageConfigRef) ?? '',
   };
 }

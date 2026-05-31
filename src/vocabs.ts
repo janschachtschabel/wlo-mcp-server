@@ -245,10 +245,20 @@ export function resolveVocab(input: string, vocab: VocabKey): string | null {
 
   const lower = trimmed.toLowerCase();
   const entries = VOCAB_MAP[vocab];
+  // 1) Exact label/alias match wins — precise and order-independent.
+  for (const entry of entries) {
+    if (entry.labels.some(l => l.toLowerCase() === lower)) return entry.id;
+  }
+  // 2) Fuzzy fallback, but ONLY between tokens of length >= 4 on both sides.
+  //    The old unbounded bidirectional `includes` mis-resolved short inputs
+  //    (e.g. "it" → "arbeit", "uni" → "kommunikation") and was order-
+  //    dependent. The length guard kills the short-token false positives
+  //    while keeping legitimate fuzzy matches for longer terms.
   for (const entry of entries) {
     if (entry.labels.some(l => {
       const ll = l.toLowerCase();
-      return ll === lower || ll.includes(lower) || lower.includes(ll);
+      if (ll.length < 4 || lower.length < 4) return false;
+      return ll.includes(lower) || lower.includes(ll);
     })) {
       return entry.id;
     }

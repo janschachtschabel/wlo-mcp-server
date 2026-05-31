@@ -14,6 +14,40 @@ import { formatNodes, formatNode, renderToText, renderToJson } from './formatter
 import type { FormattedNode } from './formatter.js';
 import { resolveVocab, listVocab, labelFromUri, type VocabKey } from './vocabs.js';
 
+// ── Topic-page display-title resolution ─────────────────────────────────────
+
+const _UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * True for technical, non-human-readable identifiers that must never be
+ * shown as a Themenseite title — namely the auto-generated `cm:name` of a
+ * page-variant node ("PAGE_VARIANT_<uuid>") and bare node UUIDs.
+ */
+function isPlaceholderTitle(s: string | undefined | null): boolean {
+  const t = (s ?? '').trim();
+  if (!t) return true;
+  if (/^page[_-]?variant/i.test(t)) return true;
+  if (_UUID_RE.test(t)) return true;
+  return false;
+}
+
+/**
+ * Pick the best human-readable title for a Themenseite, in priority order:
+ *   1. owning collection name (`cclom:title`/`cm:name` of the collection),
+ *   2. the variant node's own `cm:title` ("Seiten-Variante 1"),
+ *   3. the variant's `cm:name` — only if it is NOT a PAGE_VARIANT/UUID
+ *      placeholder.
+ * Falls back to a generic "Themenseite" so a raw UUID is never displayed.
+ */
+function pickThemePageTitle(r: ThemePageInfo): string {
+  const candidates = [r.collectionName, r.variantTitle, r.variantName];
+  for (const c of candidates) {
+    const t = (c ?? '').trim();
+    if (t && !isPlaceholderTitle(t)) return t;
+  }
+  return 'Themenseite';
+}
+
 // ── Query metadata for downstream consumers (backend → frontend) ────────────
 
 export interface LabeledCriterion {
@@ -632,7 +666,8 @@ Three search modes:
 3. By filters only (no query): Lists Themenseiten, optionally filtered by target group or educational context.
 
 Output:
-- Each result has the OWNING COLLECTION as title (no more cryptic "PAGE_VARIANT_xxx" names).
+- Each result is titled by its OWNING COLLECTION; if that can't be resolved, the page
+  variant's own title (cm:title) is used, never a cryptic "PAGE_VARIANT_xxx" id.
 - Multiple variants of the same Themenseite (different target groups) are merged into one entry.
 - Target groups are returned as readable labels ("Lehrkräfte"), not slugs.
 
@@ -723,6 +758,7 @@ Order: deterministic. By default sorted alphabetically by collection name with n
             return {
               variantId,
               variantName: vProps['cm:name']?.[0] || v.name || '',
+              variantTitle: vProps['cclom:title']?.[0] || vProps['cm:title']?.[0] || '',
               targetGroup: vProps['ccm:page_variant_profiling_target_group']?.[0] || '',
               educationalContexts: vProps['ccm:educationalcontext'] ?? [],
               isTemplate: false,
@@ -760,7 +796,10 @@ Order: deterministic. By default sorted alphabetically by collection name with n
 
         for (const r of results) {
           const collectionId = r.collectionId ?? r.variantId;
-          const title = r.collectionName?.trim() || r.variantName || collectionId;
+          // Never surface the raw "PAGE_VARIANT_<uuid>" (cm:name) or a bare
+          // node UUID. Prefer owning-collection name → variant cm:title →
+          // clean cm:name → generic "Themenseite".
+          const title = pickThemePageTitle(r);
           const eduLabels = r.educationalContexts.map(u => labelFromUri(u, 'educationalContext'));
           const tgLabel = r.targetGroup ? labelFromUri(r.targetGroup, 'targetGroup') : 'nicht gesetzt';
           const variant: Variant = {
