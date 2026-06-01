@@ -7,7 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type { SearchCriterion } from './wlo-api.js';
-import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getNodeTextContent, getNodeParents, WLO_ROOT_COLLECTION_ID, searchPageVariants, getCollectionThemePages, getTopicPageContent, buildTopicPageUrl, buildRenderUrl, BASE_URL, WLO_REPOSITORY_URL, resolveVariantCollection } from './wlo-api.js';
+import { ngsearch, searchCollectionsByKeyword, getCollectionContents, getChildCollections, getNodeMetadata, getCollectionMetadata, getNodeTextContent, getNodeParents, WLO_ROOT_COLLECTION_ID, searchPageVariants, getCollectionThemePages, getTopicPageContent, buildTopicPageUrl, buildRenderUrl, BASE_URL, WLO_REPOSITORY_URL, resolveVariantCollection } from './wlo-api.js';
 import type { TargetGroup, ThemePageInfo, WloNode } from './wlo-api.js';
 import { enhancedSearch, rerankNodes, sortByTitle } from './reranker.js';
 import { formatNodes, formatNode, renderToText, renderToJson } from './formatter.js';
@@ -1348,7 +1348,10 @@ OR collectionId (a "Sammlung-nodeId"). At least one is required.`,
         'When resolving by collectionId, pick the variant for this target group.'
       ),
       outputFormat: z.enum(['markdown', 'json']).optional().default('markdown').describe(
-        '"markdown" (default) or "json" (structured: swimlanes[] + referencedNodeIds[])'
+        '"markdown" (default) or "json". JSON is RENDER-READY: each swimlane carries its heading + up to maxPerSwimlane real content cards (resolved by EXECUTING the swimlane widget\'s saved query) + a hasMore flag, plus variantTitle and a topicPageUrl jump link. Use JSON to show "Themenseiten-Inhalte".'
+      ),
+      maxPerSwimlane: z.number().int().min(1).max(10).optional().default(3).describe(
+        'JSON only: max real content cards resolved per swimlane (default 3). hasMore signals there is more on the full topic page (topicPageUrl).'
       ),
     },
     async (params) => {
@@ -1366,7 +1369,101 @@ OR collectionId (a "Sammlung-nodeId"). At least one is required.`,
         }
 
         if (params.outputFormat === 'json') {
-          return { content: [{ type: 'text', text: JSON.stringify(struct, null, 2) }] };
+          // RENDER-READY Themenseiten-Inhalte. Die Swimlane-Items sind dynamische
+          // WIDGET-Knoten (ccm:map mit ccm:widget_config = gespeicherte Abfrage).
+          // Recipe: widget_config.propertyFilters → ngsearch-Kriterien → echte
+          // Inhalts-Karten je Swimlane (Auszug, max. maxPerSwimlane). Bewusst
+          // gedeckelt (1 Query-Widget je Swimlane, ≤ MAX_LANES Swimlanes) → die
+          // Call-Zahl bleibt beschränkt; topicPageUrl bietet den Absprung.
+          const cap = params.maxPerSwimlane && params.maxPerSwimlane > 0 ? params.maxPerSwimlane : 3;
+          const MAX_LANES = 12;
+          const norm = (s: string | undefined) => (s ?? '').replace('workspace://SpacesStore/', '');
+          const lanes = struct.swimlanes.slice(0, MAX_LANES);
+
+          // 1. Alle Widget-Knoten EINMAL auflösen (parallel) → widget_config lesen.
+          const widgetIds = [...new Set(
+            lanes.flatMap(sl => sl.items.map(it => norm(it.nodeId)).filter(x => !!x)),
+          )];
+          const widgetNodes = await getCollectionMetadata(widgetIds);
+          const cfgById = new Map<string, any>();
+          for (const wn of widgetNodes) {
+            const raw = wn.properties?.['ccm:widget_config']?.[0];
+            if (!raw) continue;
+            try {
+              const cfg = JSON.parse(raw);
+              if (cfg && typeof cfg === 'object') cfgById.set(norm(wn.ref?.id), cfg);
+            } catch { /* widget ohne gültige Config */ }
+          }
+
+          // Inhalt EINES Widgets auflösen — drei in WLO vorkommende Formen:
+          //  (a) content-teaser     → propertyFilters (gespeicherte Query) → ngsearch
+          //  (b) wlo-collection-chips → sortedNodeIds (feste Sammlungs-Liste)
+          //  (c) wlo-media-rendering  → selectedNodeId (Einzelknoten)
+          // Andere Widgets (Text/AI-Text/Navigation/Mitglieder/iframe) tragen
+          // keine Inhalte → liefern null.
+          const resolveWidget = async (
+            cfg: any,
+          ): Promise<{ items: ReturnType<typeof formatNode>[]; hasMore: boolean } | null> => {
+            const pf = cfg?.propertyFilters;
+            if (pf && typeof pf === 'object') {
+              const criteria: SearchCriterion[] = Object.entries(pf)
+                .map(([property, values]) => ({
+                  property,
+                  values: (Array.isArray(values) ? values : []).filter((v): v is string => typeof v === 'string' && v !== ''),
+                }))
+                .filter(c => c.values.length > 0);
+              if (criteria.length) {
+                try {
+                  const r = await ngsearch(criteria, 'FILES', cap);
+                  const nodes = (r.nodes ?? []).slice(0, cap);
+                  return { items: formatNodes(nodes), hasMore: (r.pagination?.total ?? nodes.length) > nodes.length };
+                } catch { return null; }
+              }
+            }
+            const sorted: string[] = Array.isArray(cfg?.sortedNodeIds)
+              ? cfg.sortedNodeIds.map((x: any) => norm(String(x))).filter((x: string) => !!x)
+              : [];
+            if (sorted.length) {
+              const take = sorted.slice(0, cap);
+              const nodes = await getCollectionMetadata(take);
+              return { items: formatNodes(nodes), hasMore: sorted.length > take.length };
+            }
+            const sel = cfg?.selectedNodeId ? norm(String(cfg.selectedNodeId)) : '';
+            if (sel) {
+              const nodes = await getCollectionMetadata([sel]);
+              return { items: formatNodes(nodes), hasMore: false };
+            }
+            return null;
+          };
+
+          // 2. Je Swimlane das ERSTE inhaltstragende Widget auflösen (parallel über Lanes).
+          const swimlanes = await Promise.all(lanes.map(async sl => {
+            const laneWidgetIds = sl.items.map(it => norm(it.nodeId)).filter(x => !!x);
+            let resolved: { items: ReturnType<typeof formatNode>[]; hasMore: boolean } | null = null;
+            for (const id of laneWidgetIds) {
+              const cfg = cfgById.get(id);
+              if (!cfg) continue;
+              resolved = await resolveWidget(cfg);
+              if (resolved && resolved.items.length) break;
+            }
+            return { heading: sl.heading, type: sl.type, items: resolved?.items ?? [], hasMore: resolved?.hasMore ?? false };
+          }));
+
+          // pageConfigRef-Wert ist für buildTopicPageUrl egal (nur truthy-Check) →
+          // collectionId als Platzhalter, baut /components/topic-pages?collectionId=…
+          const topicPageUrl = struct.collectionId
+            ? buildTopicPageUrl(struct.collectionId, struct.collectionId)
+            : null;
+          const payload = {
+            variantId: struct.variantId,
+            collectionId: struct.collectionId ?? null,
+            variantTitle: struct.variantTitle,
+            topicPageUrl,
+            swimlaneCount: swimlanes.length,
+            swimlanesTotal: struct.swimlanes.length,   // falls > MAX_LANES gedeckelt
+            swimlanes,
+          };
+          return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
         }
 
         const lines: string[] = [];

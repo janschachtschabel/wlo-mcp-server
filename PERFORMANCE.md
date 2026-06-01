@@ -26,8 +26,15 @@ Cold-Starts). Rückgabe ist ein strukturiertes Envelope:
 Themenseiten = Sammlungen mit `ccm:page_config_ref` → eine Sammlungssuche bedient
 beide Töpfe (kein separater Durchlauf). Nutzt bewusst den schnellen Keyword-Pfad
 (nicht den Baumlauf) → niedrige Concurrency.
-*Status: im MCP implementiert. Backend-Verdrahtung (App ruft das Tool + splittet
-das Envelope) steht noch aus.*
+*Status: im MCP implementiert UND im Backend verdrahtet (2026-06-01).* Der
+Chatbot ruft `search_wlo_all` im spekulativen Prefetch für generische Inhalts-/
+Sammlungs-Such-Turns (1 MCP-Call statt 3 separater) und splittet das Envelope in
+drei Per-Tool-Payloads, die der bestehende `parse_wlo_cards`/Box-Pfad unverändert
+verarbeitet. Explizite Themenseiten-Anfragen (Nutzer tippt „Themenseite"/
+„Fachportal" oder LLM-Tool-Hint = `search_wlo_topic_pages`) nutzen weiter das
+dedizierte, session-stateful `search_wlo_topic_pages`. Live verifiziert: gleiche
+Query „Photosynthese" 12,2 s (3 Calls) → 9,1 s (1 Call); Karten-Töpfe korrekt
+getrennt (content/collections/topicPages).
 
 ### O2 — Kuratierter `propertyFilter`
 edu-sharing akzeptiert Feldauswahl NUR als **wiederholten** `propertyFilter=`-Param
@@ -47,8 +54,10 @@ Varianten entfernt + Hard-Cap `MAX_VARIANTS = 5` (nach Gewicht sortiert,
 `full:` bleibt immer dabei).
 
 ### O5 — Themenseiten-Loops parallelisiert
-`getCollectionThemePages` / `getTopicPageContent` holen die page_config-Kinder
-jetzt `Promise.all`-parallel statt sequenziell (`for … await`).
+`getCollectionThemePages` holt die page_config-Kinder jetzt `Promise.all`-parallel
+statt sequenziell (`for … await`). `getTopicPageContent` braucht den per-Kind-
+Fan-out gar nicht mehr (siehe Stage-3-Befund unten: die Variante IST das
+page_config-Kind) → noch weniger Calls.
 
 ### O6 — Collections-Baumlauf gedeckelt
 Fallback-Traversal begrenzt: level2 ≤ 25 Parents, level3 ≤ 15 (mit Warn-Log).
@@ -89,6 +98,38 @@ Quality-Score (`computeRelevanceScore`) → `minScore`-Filter (Graceful-Fallback
 auf den Pool) → gelöschte Knoten raus → **auf `maxResults` gekürzt** → diese
 Top-N als formatierte Knoten + der **echte edu-sharing-Treffer-Total**. Der
 Kandidaten-Pool verlässt den MCP nie.
+
+## Themenseiten-Inhalte (`get_topic_page_content`) — Stand 2026-06-01
+
+**Bugfix (umgesetzt):** Die Variantenauflösung war kaputt — sie durchsuchte die
+*Inhalte* der `page_config_ref`-Kinder (das sind `WIDGET_*`-Knoten OHNE
+`ccm:page_variant_config`) und lieferte daher **immer 0 Swimlanes**. Tatsächlich
+tragen die page_config-**Kind-Collections selbst** den `ccm:page_variant_config`
+(Titel z.B. „Variante_Ideal" / „PAGE_VARIANT_…"). Fix in `getTopicPageContent`:
+direkt unter den Kindern die echte (Nicht-Template-)Variante wählen. Verifiziert
+gegen Staging: „Nachhaltigkeit" liefert jetzt **8 Swimlanes** mit echten
+Überschriften („Test Tina 2", „Akkordeonelement", „Ankermenü", …).
+
+**`outputFormat:'json'` = RENDER-READY (umgesetzt):** Die Swimlane-Items sind
+**WIDGET-Knoten** (`ccm:map` mit `ccm:widget_config`). Der json-Branch löst je
+Swimlane das **erste inhaltstragende Widget** zu echten Karten auf — drei in WLO
+vorkommende Formen:
+| Widget-Typ | config-Feld | Auflösung |
+|---|---|---|
+| `content-teaser` | `propertyFilters` (gespeicherte Query) | → `ngsearch(FILES)` |
+| `wlo-collection-chips` | `sortedNodeIds` (feste Liste) | → `getCollectionMetadata` |
+| `wlo-media-rendering` | `selectedNodeId` (Einzelknoten) | → `getCollectionMetadata` |
+
+Andere Widgets (Text / AI-Text / `wlo-topics-column-browser` / `editorial-members`
+/ iframe) tragen keine Inhalte → leere Swimlane (Frontend überspringt sie).
+Output je Swimlane: `{heading, type, items:[Karte…≤maxPerSwimlane], hasMore}` +
+`variantTitle` + `topicPageUrl`. Gedeckelt: ≤ `MAX_LANES=12` Swimlanes, 1 Widget/
+Swimlane, `maxPerSwimlane` (Default 3) Karten — hält die Call-Zahl beschränkt.
+**Live verifiziert (Staging):** „Nachhaltigkeit" füllt 5/8 Swimlanes —
+content-teaser → echte Inhalte („Wie funktioniert das Internet?"), collection-chips
+→ Sammlungen („Klimawandel", „Nachhaltige Ernährung"), media-rendering → 1 Knoten.
+*Backend-/Frontend-Verdrahtung (Intent/Pattern + Swimlane-Boxen mit „(Auszug)" +
+Absprung-Button) steht noch aus — Backend ruft das Tool noch nicht.*
 
 ## Offenes Optimierungspotenzial
 

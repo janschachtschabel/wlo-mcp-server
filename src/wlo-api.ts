@@ -686,31 +686,24 @@ export async function getTopicPageContent(
   if (variantNode && !hasVariantConfig(variantNode)) {
     const ref = variantNode.properties?.['ccm:page_config_ref']?.[0];
     if (!ref) return null;
+    // Die Page-Varianten SIND die Kind-Collections des page_config_ref-Ordners:
+    // sie tragen SELBST ``ccm:page_variant_config`` (Titel z.B. "Variante_Ideal"
+    // / "PAGE_VARIANT_…"). Früher wurden fälschlich deren INHALTE durchsucht —
+    // das sind aber WIDGET_*-Knoten OHNE Config → immer 0 Swimlanes. Jetzt direkt
+    // unter den Kindern die echte (Nicht-Template-)Variante wählen. Spart zudem
+    // den per-Kind getCollectionContents-Fan-out (weniger edu-sharing-Calls).
     const configChildren = await getChildCollections(stripStoreRef(ref), 50, 0, TOPIC_PAGE_PROPS);
-    // O5: alle page_config-Kinder PARALLEL laden, dann den ersten passenden
-    // Treffer in ursprünglicher Reihenfolge wählen (vorher sequenziell).
-    const contentsPerChild = await Promise.all(
-      configChildren.map(cn => {
-        const cnId = cn.ref?.id;
-        return cnId
-          ? getCollectionContents(cnId, 'both', 50, 0, TOPIC_PAGE_PROPS)
-          : Promise.resolve(null);
-      }),
+    const variants = configChildren.filter(
+      n => hasVariantConfig(n)
+        && n.properties?.['ccm:page_variant_is_template']?.[0] !== 'true',
     );
-    let picked: WloNode | null = null;
-    for (const vr of contentsPerChild) {
-      if (!vr) continue;
-      const candidates = vr.nodes.filter(
-        n => n.properties?.['ccm:page_variant_is_template']?.[0] !== 'true',
-      );
-      const pick = opts.targetGroup
-        ? candidates.find(
+    variantNode = (
+      opts.targetGroup
+        ? variants.find(
             n => n.properties?.['ccm:page_variant_profiling_target_group']?.[0] === opts.targetGroup,
           )
-        : candidates[0];
-      if (pick) { picked = pick; break; }
-    }
-    variantNode = picked;
+        : undefined
+    ) ?? variants[0] ?? null;
   }
 
   if (!variantNode) return null;
