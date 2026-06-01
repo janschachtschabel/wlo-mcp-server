@@ -8,7 +8,20 @@ import { ngsearch } from './wlo-api.js';
 
 // ── Query Expansion ──────────────────────────────────────────────────────────
 
-const POOL_SIZE = 40;
+// Kandidaten-Pool JE Such-Variante fürs Ranking — NICHT die ausgelieferte
+// Trefferzahl (das ist maxResults). Kleinerer Pool = schnellere/kleinere
+// Fetches bei minimal geringerem Recall. Default 25 (von 40 gesenkt),
+// per Env ``WLO_POOL_SIZE`` übersteuerbar.
+const POOL_SIZE: number = (() => {
+  const v = parseInt(process.env['WLO_POOL_SIZE'] ?? '', 10);
+  return Number.isFinite(v) && v > 0 ? v : 25;
+})();
+
+// O4: Obergrenze für parallele Query-Varianten (= parallele ngsearch-Calls).
+// Varianten werden nach Gewicht sortiert und auf die besten MAX_VARIANTS
+// gekürzt, damit ein synonym-/termreicher Query nicht zweistellig viele
+// Backend-Calls auslöst. ``full:`` (Gewicht 1.0) bleibt dadurch immer dabei.
+const MAX_VARIANTS = 5;
 
 const DE_STOPWORDS = new Set([
   'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'einer', 'einem', 'einen', 'eines',
@@ -88,13 +101,13 @@ function expandQuery(query: string): QueryVariant[] {
     variants.push({ label: `syn:"${synQuery}"`, weight: 0.6, criteria: [{ property: 'ngsearchword', values: [synQuery] }] });
   }
 
-  if (significantTerms.length >= 2) {
-    for (const term of significantTerms) {
-      variants.push({ label: `term:"${term}"`, weight: 0.5, criteria: [{ property: 'ngsearchword', values: [term] }] });
-    }
-  }
-
-  return variants;
+  // O4: Die früheren Einzelterm-Varianten (term:"X", Gewicht 0.5) sind
+  // entfernt — sie erzeugten je 1 ngsearch-Call PRO Term bei geringstem
+  // Mehrwert, da die Keyword-Variante (kw:) die Einzelterme über
+  // cclom:general_keyword bereits abdeckt. Stattdessen: nach Gewicht
+  // sortieren und auf die besten MAX_VARIANTS deckeln.
+  variants.sort((a, b) => b.weight - a.weight);
+  return variants.slice(0, MAX_VARIANTS);
 }
 
 // ── Relevance Scoring ────────────────────────────────────────────────────────

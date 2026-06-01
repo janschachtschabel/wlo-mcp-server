@@ -25,6 +25,14 @@ Kompatibel mit **OpenAI** (Responses API + native MCP), **Anthropic Claude** und
 
 ## Was ist neu in v2
 
+### v2.1 — Performance & kombinierte Suche (2026-06)
+- **`search_wlo_all`** — neues Tool: Einzel-Inhalte + Sammlungen + Themenseiten in **EINEM parallelen Aufruf**, mit getrennten Töpfen (`content` / `collections` / `topicPages`). Spart dem Client mehrere separate Such-Aufrufe (= weniger Round-Trips / Cold-Starts).
+- **Kuratierter `propertyFilter`** — Such-/Bulk-Fetches fordern nur die ~24 real genutzten Felder statt `-all-` (~59) → deutlich kleinere Payloads. `_DISPLAYNAME`-Labels bleiben erhalten; `get_node_details` bleibt bewusst auf `-all-`.
+- **Einheitliches Reranking** — `rerankNodes` greift jetzt auch für **Sammlungen** und **Themenseiten** (zuvor nur Inhalte): Exakt-Treffer rücken nach oben, off-topic raus. Sicher — nur Umsortierung + Entfernen gelöschter Knoten, **kein** Score-Drop.
+- **Such-Varianten gedeckelt** — Query-Expansion auf max. **5** parallele `ngsearch`-Calls (Einzelterm-Varianten entfernt).
+- **`WLO_POOL_SIZE`** (Env, Default **25**, vorher fix 40) — Kandidaten-Pool je Such-Variante.
+- Details, Einstellungen + Messungen: siehe **[`PERFORMANCE.md`](./PERFORMANCE.md)**.
+
 ### Hinzugekommen
 - **`get_subject_portals`** — listet die Fachportale (Top-Level-Sammlungen unter dem WLO-Wurzelknoten) deterministisch alphabetisch.
 - **`browse_collection_tree`** — strukturierter Drilldown in Sub-Sammlungen (Tiefe 1 oder 2), optional mit File-Counts.
@@ -83,6 +91,7 @@ cp .env.example .env
 | `WLO_REPOSITORY_URL` | URL des Edu-Sharing-Frontend-Hosts (z.B. `https://redaktion.openeduhub.net/edu-sharing` oder `https://repository.staging.openeduhub.net/edu-sharing`) | WLO-Production | Edu-Sharing-Instanz, gegen die der Server arbeitet. Pfade sind in allen Instanzen identisch (`<base>/rest/...` für REST, `<base>/components/...` für Frontend) — daher reicht die Base-URL als Schalter zwischen Prod / Staging / eigenem Repository. **Eingabe-Toleranz:** Whitespace, Trailing-Slash(es) und ein angehängtes `/rest` werden automatisch entfernt; fehlendes Protokoll wird zu `https://` ergänzt. Bei verdächtigen Eingaben (deep links auf `/components/...`, doppeltes `/edu-sharing`) loggt der Server beim Start eine Warnung. |
 | `WLO_ROOT_COLLECTION_ID` | UUID | `5e40e372-735c-4b17-bbf7-e827a5702b57` | Wurzelknoten der Sammlungs-Hierarchie. Identisch auf WLO-Production und -Staging. Override nur nötig, wenn ein eigenständiges Repository mit anderem Root läuft. |
 | `PORT` | Zahl | `3000` | HTTP-Port (nur HTTP-Modus) |
+| `WLO_POOL_SIZE` | Zahl | `25` | Kandidaten-Pool **je Such-Variante** (`enhancedSearch`) fürs Reranking — **nicht** die ausgelieferte Trefferzahl (das ist `maxResults`). Kleiner = schnellere/kleinere Fetches bei minimal geringerem Recall. |
 
 > **Ein Server = ein Repository.** Der MCP zeigt pro Prozess auf genau eine Edu-Sharing-Instanz. Wer parallel beide Welten anbieten will, deployt zwei Instanzen (z.B. zwei Vercel-Projekte mit unterschiedlichem `WLO_REPOSITORY_URL`).
 
@@ -112,10 +121,12 @@ npm run dev:http      # HTTP mit Auto-Reload
 | 8 | `browse_collection_tree` | Drilldown in Sub-Sammlungen (Tiefe 1–2), optional mit File-Counts | markdown / json |
 | 9 | `wlo_health_check` | Status + Latenz der WLO-API | json |
 | 10 | `get_nodes_details` | Bulk-Metadata für mehrere `nodeIds` parallel | json |
+| 11 | `search_wlo_all` | **Kombiniert**: Inhalte + Sammlungen + Themenseiten in EINEM parallelen Aufruf, getrennte Töpfe | json / markdown |
 
 > **Konzept:** In WLO sind **Sammlungen** und **Themenseiten** dasselbe. Eine Sammlung wird im Repository als Themenseite angezeigt und bündelt Inhalte in **Schwimmlinien (Swimlanes/Karussells)**. Sub-Sammlungen entsprechen Unter-Themenseiten. Sammlungen mit `ccm:page_config_ref` haben eine kuratierte **Themenseite** mit zielgruppenspezifischen Varianten (Lehrkräfte / Lernende / Allgemein).
 
 > **Tool-Routing-Heuristik (für LLMs):**
+> - User fragt **breit nach einem Thema** und will Inhalte + Sammlungen + Themenseiten gemeinsam → `search_wlo_all` (ein Aufruf, getrennte Töpfe)
 > - User fragt nach **Material/Inhaltstyp** (Video, Arbeitsblatt, …) → `search_wlo_content`
 > - User fragt nach **Themenseite/Sammlung** zu einem Thema → `search_wlo_topic_pages` (Mode B mit query)
 > - User will durch ein Fach **navigieren** (Drilldown) → erst `get_subject_portals`, dann `browse_collection_tree`
@@ -128,7 +139,7 @@ npm run dev:http      # HTTP mit Auto-Reload
 
 ### 1. `search_wlo_collections`
 
-Sucht thematische Sammlungen. Drei-stufige Strategie: Volltext-API → Baum-Traversierung Level 2 → Level 3.
+Sucht thematische Sammlungen. Drei-stufige Strategie: Volltext-API → Baum-Traversierung Level 2 (≤25 Parents) → Level 3 (≤15 Parents). Treffer werden bei vorhandenem `query` nach Relevanz **gerankt** (`rerankNodes`), bevor `maxResults` greift — bringt Exakt-Treffer nach oben.
 
 | Parameter | Typ | Default | Beschreibung |
 |---|---|---|---|
@@ -166,8 +177,8 @@ Globale Volltextsuche nach Bildungsmaterialien (Files). Mit **Multi-Query-Expans
 | `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
 
 **Reranking-Pipeline:**
-1. **Query Expansion**: Volltext, Title-Match, Keyword-Hits, Synonym-Map, Einzelterme
-2. **Parallele API-Calls** (bis zu 40 Treffer / Variante)
+1. **Query Expansion**: Volltext, Title-Match, Keyword-Hits, Synonym-Map — gedeckelt auf **max. 5 Varianten** (nach Gewicht, `full:` immer dabei)
+2. **Parallele API-Calls** (`WLO_POOL_SIZE` Treffer / Variante, Default 25)
 3. **RRF (Reciprocal Rank Fusion)** mit Variant-Gewichtung
 4. **Quality Score** (Titel: 30 Pt., Keywords: 10 Pt., Beschreibung: 8 Pt., Metadaten-Qualität)
 5. **Endformel**: `0.8 × quality + 0.1 × rrf + 0.1 × multi_appearance_bonus`
@@ -253,7 +264,7 @@ Themenseiten finden, listen oder eine spezifische Sammlung prüfen.
 | `educationalContext` | string | – | Bildungsstufe |
 | `collectionId` | string | – | Direkt-Check einer Sammlung (Mode A) |
 | `mergeVariants` | bool | `true` | Mehrere Varianten derselben Sammlung in eine Karte zusammenfassen |
-| `sort` | enum | `"alpha"` | `"alpha"` (deterministisch) oder `"relevance"` |
+| `sort` | enum | Query→`"relevance"`, sonst `"alpha"` | `"alpha"` (deterministisch) oder `"relevance"`. Bei Themen-Query (Mode B) ist **Relevanz Default** (Eingangs-Sammlungen werden gerankt); beim reinen Auflisten (Mode C) alphabetisch. |
 | `maxResults` | int | `5` | 1–20 |
 | `outputFormat` | enum | `"markdown"` | `"markdown"` oder `"json"` |
 
@@ -360,6 +371,37 @@ Bulk-Fetch für mehrere `nodeIds` (max. 50 / Aufruf, parallel).
 ```
 
 Einzelne Fehler (gelöschte Node, Netzwerk-Fehler) landen im `failed[]` — der Batch crasht nicht.
+
+---
+
+### 11. `search_wlo_all`
+
+Kombinierte Suche: liefert **Einzel-Inhalte + Sammlungen + Themenseiten in EINEM Aufruf**, intern parallel (`Promise.all`). Spart dem Client mehrere separate Such-Aufrufe. Themenseiten = Sammlungen mit `ccm:page_config_ref` → eine Sammlungssuche bedient beide Töpfe (kein separater Durchlauf). Nutzt bewusst den schnellen Keyword-Pfad für Sammlungen (nicht den Baum-Fallback) → niedrige Concurrency.
+
+| Parameter | Typ | Default | Beschreibung |
+|---|---|---|---|
+| `query` | string | **Pflicht** | Suchbegriff |
+| `educationalContext` | string | – | Bildungsstufe (Label oder URI) |
+| `discipline` | string | – | Fach (Label oder URI) |
+| `userRole` | string | – | Zielgruppe (Label oder URI) |
+| `learningResourceType` | string | – | Ressourcentyp (Label oder URI) |
+| `publisher` | string | – | Anbieter-Filter |
+| `maxContent` | int | `8` | Max. Einzel-Inhalte (1–50) |
+| `maxCollections` | int | `5` | Max. je Sammlungen / Themenseiten (1–20) |
+| `include` | string[] | alle | Teilmenge aus `content` / `collections` / `topicPages` |
+| `excludeNodeIds` | string[] | – | Bereits gesehene IDs überspringen |
+| `outputFormat` | enum | `"json"` | `"json"` (getrennte Töpfe, für maschinelle Aufteilung) oder `"markdown"` |
+
+**JSON-Output (Envelope mit getrennten Töpfen):**
+```json
+{
+  "query": "Photosynthese",
+  "content":     { "total": 209, "count": 8, "results": [ /* FormattedNode[] */ ] },
+  "collections": { "total": 6,   "count": 5, "results": [ /* … */ ] },
+  "topicPages":  { "total": 1,   "count": 1, "results": [ /* Sammlungen mit topicPageUrl */ ] }
+}
+```
+Jeder Topf trägt zusätzlich ein `_queryMeta` (Such-URL für den jeweiligen Topf). Alle drei Listen sind reranked (Relevanz). Der Client kann die Töpfe direkt in getrennte Anzeige-Bereiche einsortieren.
 
 ---
 
@@ -602,7 +644,7 @@ response = client.beta.messages.create(
 ```
 wlomcp/
 ├── src/
-│   ├── server.ts       # 10 Tool-Definitionen (transport-agnostisch)
+│   ├── server.ts       # 11 Tool-Definitionen (transport-agnostisch)
 │   ├── vocabs.ts       # Label ↔ URI Mappings (educationalContext, discipline,
 │   │                   #   userRole, lrt, license, targetGroup)
 │   ├── wlo-api.ts      # WLO/EduSharing-API-Client + resolveVariantCollection

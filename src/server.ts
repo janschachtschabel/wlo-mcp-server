@@ -245,7 +245,11 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
         const kept = excluded.size
           ? nodes.filter(n => !excluded.has(n.ref?.id ?? ''))
           : nodes;
-        const formatted = formatNodes(kept.slice(0, maxResults));
+        // Einheitliches Reranking (wie bei Inhalten): bei vorhandenem Query nach
+        // Relevanz; rerankNodes ist bei leerem Query (Browse) ein No-op und
+        // entfernt sonst nur gelöschte Knoten — kann nichts Relevantes verlieren.
+        const ranked = rerankNodes(kept, params.query ?? '');
+        const formatted = formatNodes(ranked.slice(0, maxResults));
         const text = (params.outputFormat ?? 'markdown') === 'json'
           ? renderToJson(formatted, total)
           : (renderToText(formatted, total) || emptyMsg);
@@ -282,8 +286,16 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
 
         let matches = level1.filter(n => matchesQuery(n, query));
 
+        // O6: Breite des rekursiven Baumlaufs deckeln, damit der Fallback nie
+        // zur 100+-Parallel-Call-Lawine wird. Direkte Treffer in level1 bleiben
+        // vollständig erhalten; nur die Expansion in tiefere Ebenen ist begrenzt.
+        const LEVEL2_PARENT_CAP = 25;
+        const level2Parents = level1.slice(0, LEVEL2_PARENT_CAP);
+        if (level1.length > LEVEL2_PARENT_CAP) {
+          console.warn(`[wlo-mcp] collection search: level2-Expansion gedeckelt ${level1.length} → ${LEVEL2_PARENT_CAP} Parents (query="${query}")`);
+        }
         const level2Results = await Promise.allSettled(
-          level1.map(parent => getChildCollections(parent.ref?.id ?? '', 50))
+          level2Parents.map(parent => getChildCollections(parent.ref?.id ?? '', 50))
         );
         const allLevel2Nodes: import('./wlo-api.js').WloNode[] = [];
         for (const r of level2Results) {
@@ -304,9 +316,10 @@ Filters accept both German labels (e.g. "Mathematik", "Grundschule", "Lehrer/in"
             return queryWords.reduce((s, w) => s + (text.includes(w) ? 1 : 0), 0);
           };
           const anyScored = allLevel2Nodes.some(n => scoreNode(n) > 0);
+          const LEVEL3_PARENT_CAP = 15;
           const level2Candidates = anyScored
-            ? [...allLevel2Nodes].sort((a, b) => scoreNode(b) - scoreNode(a)).slice(0, 30)
-            : allLevel2Nodes.slice(0, 30);
+            ? [...allLevel2Nodes].sort((a, b) => scoreNode(b) - scoreNode(a)).slice(0, LEVEL3_PARENT_CAP)
+            : allLevel2Nodes.slice(0, LEVEL3_PARENT_CAP);
 
           const level3Results = await Promise.allSettled(
             level2Candidates.map(parent => getChildCollections(parent.ref?.id ?? '', 30))
@@ -638,6 +651,116 @@ Plus optional:
     },
   );
 
+  // ── Tool: search_wlo_all (kombinierte Suche — O1) ─────────────────────────
+  // Liefert Einzel-Inhalte + Sammlungen + Themenseiten in EINEM Aufruf, intern
+  // PARALLEL. Spart dem Client die separaten Aufrufe von search_wlo_content +
+  // search_wlo_collections (= weniger MCP-Round-Trips/Cold-Starts). Themenseiten
+  // = Sammlungen mit ccm:page_config_ref → eine Sammlungssuche bedient beide
+  // Töpfe, kein separater Themenseiten-Durchlauf nötig. Rückgabe ist ein
+  // STRUKTURIERTES Objekt mit getrennten Töpfen (content/collections/topicPages),
+  // damit der Client sie direkt in getrennte Anzeige-Bereiche einsortieren kann.
+  server.tool(
+    'search_wlo_all',
+    `Kombinierte WLO-Suche: Einzel-Inhalte (Materialien), Sammlungen UND
+Themenseiten in EINEM parallelen Aufruf. Nutze dies statt mehrere
+Suchtools nacheinander zu rufen. Liefert ein strukturiertes Objekt mit
+getrennten Töpfen { content, collections, topicPages }. Filter akzeptieren
+deutsche Labels (z.B. "Mathematik", "Sekundarstufe I", "Video") oder URIs.`,
+    {
+      query: z.string().describe('Suchbegriff (Deutsch), z.B. "Bruchrechnung Klasse 7"'),
+      educationalContext: z.string().optional().describe('Bildungsstufe: "Primarstufe", "Sekundarstufe I", … oder URI'),
+      discipline: z.string().optional().describe('Fach: "Mathematik", "Biologie", … oder URI'),
+      userRole: z.string().optional().describe('Zielgruppe: "Lehrer/in", "Lerner/in", … oder URI'),
+      learningResourceType: z.string().optional().describe('Ressourcentyp: "Arbeitsblatt", "Video", … oder URI'),
+      publisher: z.string().optional().describe('Anbieter, z.B. "Klexikon", "Serlo"'),
+      maxContent: z.number().int().min(1).max(50).optional().default(8).describe('Max. Einzel-Inhalte (Default 8)'),
+      maxCollections: z.number().int().min(1).max(20).optional().default(5).describe('Max. je Sammlungen/Themenseiten (Default 5)'),
+      include: z.array(z.enum(['content', 'collections', 'topicPages'])).optional().describe(
+        'Welche Töpfe geliefert werden (Default: alle drei).'
+      ),
+      excludeNodeIds: z.array(z.string()).optional().describe('Bereits gesehene Node-IDs überspringen'),
+      outputFormat: z.enum(['json', 'markdown']).optional().default('json').describe(
+        '"json" (Default, getrennte Töpfe — für maschinelle Aufteilung) oder "markdown"'
+      ),
+    },
+    async (params) => {
+      const query = params.query.trim();
+      const want = new Set(params.include ?? ['content', 'collections', 'topicPages']);
+      const excluded = new Set(params.excludeNodeIds ?? []);
+      const maxContent = params.maxContent ?? 8;
+      const maxColl = params.maxCollections ?? 5;
+      const { labeled } = buildFilterCriteria(params);
+      const { criteria: filters } = buildFilterCriteria(params);
+
+      const EMPTY = { nodes: [] as import('./wlo-api.js').WloNode[], pagination: { total: 0, from: 0, count: 0 } };
+
+      try {
+        // O1: Inhalte + Sammlungen PARALLEL. enhancedSearch ist intern bereits
+        // varianten-parallel (nach O4 auf max. 5 gedeckelt); die Sammlungssuche
+        // ist EIN Keyword-Call (bewusst NICHT der teure Baumlauf — hält die
+        // Gesamt-Concurrency niedrig). Wall-Zeit ≈ langsamster der beiden Töpfe.
+        const needColl = want.has('collections') || want.has('topicPages');
+        const [contentResp, collNodes] = await Promise.all([
+          want.has('content')
+            ? enhancedSearch(query, 'FILES', filters, maxContent + excluded.size)
+            : Promise.resolve(EMPTY),
+          needColl
+            ? searchCollectionsByKeyword(query, (maxColl + excluded.size) * 2)
+            : Promise.resolve([] as import('./wlo-api.js').WloNode[]),
+        ]);
+
+        const ok = (id: string) => !!id && !excluded.has(id);
+
+        const contentFmt = formatNodes(contentResp.nodes).filter(n => ok(n.nodeId)).slice(0, maxContent);
+
+        // Sammlungen vs. Themenseiten trennen: topicPageUrl gesetzt ⇒ Themenseite
+        // (formatNode leitet das aus ccm:page_config_ref ab).
+        // Sammlungen ebenfalls reranken (sonst nur API-Reihenfolge); die
+        // Themenseiten (page_config_ref) erben daraus die Relevanz-Ordnung.
+        const collAll = formatNodes(rerankNodes(collNodes, query)).filter(n => ok(n.nodeId));
+        const topicPagesFmt = want.has('topicPages') ? collAll.filter(n => n.topicPageUrl).slice(0, maxColl) : [];
+        const collectionsFmt = want.has('collections') ? collAll.filter(n => !n.topicPageUrl).slice(0, maxColl) : [];
+
+        const metas: { type: 'text'; text: string }[] = [];
+        if (want.has('content')) {
+          metas.push(queryMetaContent({
+            toolName: 'search_wlo_all:content', queryType: 'ngsearch_enhanced', searchTerm: query,
+            criteria: [{ property: 'ngsearchword', values: [query] }, ...labeled],
+            pagination: { maxItems: maxContent, skipCount: 0, totalResults: contentResp.pagination.total },
+            repositoryUrl: WLO_REPOSITORY_URL,
+          }));
+        }
+        if (needColl) {
+          metas.push(queryMetaContent({
+            toolName: 'search_wlo_all:collections', queryType: 'keyword_collections', searchTerm: query,
+            criteria: [{ property: 'ngsearchword', values: [query] }],
+            pagination: { maxItems: maxColl, skipCount: 0, totalResults: collAll.length },
+            repositoryUrl: WLO_REPOSITORY_URL,
+          }));
+        }
+
+        const envelope = {
+          query,
+          content:     { total: contentResp.pagination.total, count: contentFmt.length, results: contentFmt },
+          collections: { total: collectionsFmt.length, count: collectionsFmt.length, results: collectionsFmt },
+          topicPages:  { total: topicPagesFmt.length, count: topicPagesFmt.length, results: topicPagesFmt },
+        };
+
+        if ((params.outputFormat ?? 'json') === 'json') {
+          return { content: [{ type: 'text' as const, text: JSON.stringify(envelope, null, 2) }, ...metas] };
+        }
+        const md: string[] = [];
+        if (want.has('content'))     { md.push(`# Inhalte (${contentFmt.length})`);          md.push(renderToText(contentFmt, contentResp.pagination.total) || 'Keine Inhalte gefunden.'); }
+        if (want.has('collections')) { md.push(`# Sammlungen (${collectionsFmt.length})`);    md.push(renderToText(collectionsFmt) || 'Keine Sammlungen gefunden.'); }
+        if (want.has('topicPages'))  { md.push(`# Themenseiten (${topicPagesFmt.length})`);   md.push(renderToText(topicPagesFmt) || 'Keine Themenseiten gefunden.'); }
+        return { content: [{ type: 'text' as const, text: md.join('\n\n') }, ...metas] };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: 'text', text: `Fehler bei der kombinierten Suche: ${msg}` }], isError: true };
+      }
+    },
+  );
+
   // ── Tool 6: lookup_wlo_vocabulary ─────────────────────────────────────────
   server.tool(
     'lookup_wlo_vocabulary',
@@ -729,7 +852,9 @@ Order: deterministic. By default sorted alphabetically by collection name with n
     },
     async (params) => {
       const tg = params.targetGroup as TargetGroup | undefined;
-      const sort = params.sort ?? 'alpha';
+      // Bei Themen-Query default = Relevanz (nutzt das Sammlungs-Reranking);
+      // beim reinen Auflisten (Mode C, kein Query) bleibt alphabetisch.
+      const sort = params.sort ?? (params.query?.trim() ? 'relevance' : 'alpha');
       const merge = params.mergeVariants !== false;
       let queryType = 'topic_pages';
 
@@ -745,7 +870,7 @@ Order: deterministic. By default sorted alphabetically by collection name with n
         // ── Mode B: Topic-based search (collection → page_config_ref) ────────
         else if (params.query?.trim()) {
           queryType = 'topic_pages_by_keyword';
-          const collections = await searchCollectionsByKeyword(params.query, 10);
+          const collections = rerankNodes(await searchCollectionsByKeyword(params.query, 10), params.query);
           for (const coll of collections) {
             const cId = coll.ref?.id;
             if (!cId) continue;

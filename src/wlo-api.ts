@@ -139,6 +139,59 @@ const HEADERS = {
   'Content-Type': 'application/json',
 };
 
+// ── Property-Filter (O2: nur real genutzte Felder anfordern) ──────────────────
+//
+// edu-sharing akzeptiert ``propertyFilter`` NUR als WIEDERHOLTEN Query-Param
+// (``&propertyFilter=a&propertyFilter=b``). Eine Kommaliste liefert 0 Properties
+// (verifiziert gegen Staging 2026-06). ``_DISPLAYNAME``-Begleitfelder MÜSSEN
+// explizit mitgelistet werden — kommen dann aber korrekt zurück.
+//
+// DISPLAY_PROPS = das von formatter.ts + reranker.ts real konsumierte Set
+// (statt ``-all-`` mit ~59 Properties/Node → ~24 → deutlich kleinere Payloads
+// bei 6 Query-Varianten × bis zu 40 Treffern).
+export const DISPLAY_PROPS: string[] = [
+  // Titel + Beschreibung + Ranking
+  'cclom:title', 'cm:title', 'cm:name',
+  'cclom:general_description', 'cclom:general_keyword',
+  // Vokabular-Felder (+ server-seitige Labels)
+  'ccm:taxonid', 'ccm:taxonid_DISPLAYNAME',
+  'ccm:educationalcontext', 'ccm:educationalcontext_DISPLAYNAME',
+  'ccm:educationalintendedenduserrole', 'ccm:educationalintendedenduserrole_DISPLAYNAME',
+  'ccm:oeh_lrt_aggregated', 'ccm:oeh_lrt_aggregated_DISPLAYNAME',
+  'ccm:oeh_lrt', 'ccm:oeh_lrt_DISPLAYNAME',
+  // Links / Lizenz / Quelle
+  'ccm:wwwurl', 'ccm:commonlicense_key',
+  'ccm:oeh_publisher_combined',
+  'ccm:replicationsource', 'ccm:replicationsource_DISPLAYNAME', // Bezugsquelle (z.B. Klexikon)
+  'ccm:author_freetext',
+  // Struktur / IDs
+  'ccm:page_config_ref',
+  'sys:node-uuid', 'virtual:primaryparent_nodeid',
+];
+
+// Themenseiten-Varianten brauchen zusätzlich die page_variant-Felder
+// (Template-Flag, Zielgruppe, Swimlane-Config).
+export const TOPIC_PAGE_PROPS: string[] = [
+  ...DISPLAY_PROPS,
+  'ccm:page_variant_is_template',
+  'ccm:page_variant_profiling_target_group',
+  'ccm:page_variant_config',
+];
+
+/**
+ * Hängt den ``propertyFilter`` an die Query-Params an. ``props`` undefined ODER
+ * leer ⇒ ``-all-`` (Voll-Set, z.B. für get_node_details). Sonst pro Feld EIN
+ * wiederholter ``propertyFilter``-Param (das ist das einzige Format, das
+ * edu-sharing für Feldauswahl akzeptiert).
+ */
+function appendPropertyFilter(params: URLSearchParams, props?: string[]): void {
+  if (props && props.length > 0) {
+    for (const p of props) params.append('propertyFilter', p);
+  } else {
+    params.append('propertyFilter', '-all-');
+  }
+}
+
 /**
  * Build the topic-pages URL for a collection that has ccm:page_config_ref.
  * Returns null if pageConfigRef is falsy.
@@ -172,13 +225,14 @@ export async function ngsearch(
   contentType: NgsearchContentType = 'FILES',
   maxItems = 20,
   skipCount = 0,
+  props: string[] | undefined = DISPLAY_PROPS,
 ): Promise<SearchResponse> {
   const params = new URLSearchParams({
     contentType,
     maxItems: String(maxItems),
     skipCount: String(skipCount),
-    propertyFilter: '-all-',
   });
+  appendPropertyFilter(params, props);
 
   const url = `${BASE_URL}/search/v1/queries/-home-/mds_oeh/ngsearch?${params}`;
   const body = JSON.stringify({ criteria: criteria.map(c => ({ property: c.property, values: c.values })) });
@@ -203,13 +257,14 @@ export async function ngsearchCollections(
   criteria: SearchCriterion[],
   maxItems = 20,
   skipCount = 0,
+  props: string[] | undefined = DISPLAY_PROPS,
 ): Promise<SearchResponse> {
   const params = new URLSearchParams({
     filter: 'collections',
     maxItems: String(maxItems),
     skipCount: String(skipCount),
-    propertyFilter: '-all-',
   });
+  appendPropertyFilter(params, props);
 
   const url = `${BASE_URL}/search/v1/queries/-home-/mds_oeh/ngsearch?${params}`;
   const body = JSON.stringify({ criteria: criteria.map(c => ({ property: c.property, values: c.values })) });
@@ -232,13 +287,14 @@ export async function ngsearchCollections(
 export async function searchCollectionsByKeyword(
   query: string,
   maxItems = 10,
+  props: string[] | undefined = DISPLAY_PROPS,
 ): Promise<WloNode[]> {
   const params = new URLSearchParams({
     contentType: 'COLLECTIONS',
     maxItems: String(maxItems),
     skipCount: '0',
-    propertyFilter: '-all-',
   });
+  appendPropertyFilter(params, props);
   const url = `${BASE_URL}/search/v1/queries/-home-/mds_oeh/collections?${params}`;
   const body = JSON.stringify({ criteria: [{ property: 'ngsearchword', values: [query] }] });
   const res = await fetch(url, { method: 'POST', headers: HEADERS, body });
@@ -256,13 +312,14 @@ export async function getCollectionContents(
   filter: 'files' | 'folders' | 'both' = 'files',
   maxItems = 30,
   skipCount = 0,
+  props: string[] | undefined = DISPLAY_PROPS,
 ): Promise<SearchResponse> {
   const params = new URLSearchParams({
     maxItems: String(maxItems),
     skipCount: String(skipCount),
-    propertyFilter: '-all-',
   });
   if (filter !== 'both') params.set('filter', filter);
+  appendPropertyFilter(params, props);
 
   const url = `${BASE_URL}/node/v1/nodes/-home-/${nodeId}/children?${params}`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
@@ -284,13 +341,14 @@ export async function getChildCollections(
   nodeId: string,
   maxItems = 100,
   skipCount = 0,
+  props: string[] | undefined = DISPLAY_PROPS,
 ): Promise<WloNode[]> {
   const params = new URLSearchParams({
     filter: 'folders',
     maxItems: String(maxItems),
     skipCount: String(skipCount),
-    propertyFilter: '-all-',
   });
+  appendPropertyFilter(params, props);
 
   const url = `${BASE_URL}/node/v1/nodes/-home-/${nodeId}/children?${params}`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
@@ -417,8 +475,8 @@ export async function searchPageVariants(
     contentType: 'ALL',
     maxItems: String(maxItems),
     skipCount: '0',
-    propertyFilter: '-all-',
   });
+  appendPropertyFilter(params, TOPIC_PAGE_PROPS);
   const url = `${BASE_URL}/search/v1/queries/-home-/mds_oeh/page_variant?${params}`;
   const body = JSON.stringify({ criteria });
   const res = await fetch(url, { method: 'POST', headers: HEADERS, body });
@@ -512,41 +570,42 @@ export async function getCollectionThemePages(
   const configId = pageConfigRef.replace('workspace://SpacesStore/', '');
 
   // Config folder → children (page_config nodes) → their children (PAGE_VARIANT)
-  const configChildren = await getChildCollections(configId, 50);
-  const results: ThemePageInfo[] = [];
+  const configChildren = await getChildCollections(configId, 50, 0, TOPIC_PAGE_PROPS);
   const collectionName = props['cclom:title']?.[0] || props['cm:name']?.[0] || node.name || '';
   const topicPageUrl = buildTopicPageUrl(collectionId, pageConfigRef) ?? '';
 
-  for (const configNode of configChildren) {
-    const configNodeId = configNode.ref?.id;
-    if (!configNodeId) continue;
+  // O5: Varianten ALLER page_config-Kinder PARALLEL holen (vorher eine
+  // sequenzielle ``for … await``-Schleife — bei N Kindern = N serielle Calls).
+  const perConfig = await Promise.all(
+    configChildren.map(async (configNode): Promise<ThemePageInfo[]> => {
+      const configNodeId = configNode.ref?.id;
+      if (!configNodeId) return [];
+      const variantResp = await getCollectionContents(configNodeId, 'both', 50, 0, TOPIC_PAGE_PROPS);
+      const out: ThemePageInfo[] = [];
+      for (const variant of variantResp.nodes) {
+        const vProps = variant.properties ?? {};
+        const isTemplate = vProps['ccm:page_variant_is_template']?.[0] === 'true';
+        if (isTemplate) continue;
 
-    // Get variants (files) under each page_config
-    const variantResp = await getCollectionContents(configNodeId, 'both', 50);
-    for (const variant of variantResp.nodes) {
-      const vProps = variant.properties ?? {};
-      const isTemplate = vProps['ccm:page_variant_is_template']?.[0] === 'true';
-      if (isTemplate) continue;
+        const vTargetGroup = vProps['ccm:page_variant_profiling_target_group']?.[0] || '';
+        if (targetGroup && vTargetGroup && vTargetGroup !== targetGroup) continue;
 
-      const vTargetGroup = vProps['ccm:page_variant_profiling_target_group']?.[0] || '';
-      if (targetGroup && vTargetGroup && vTargetGroup !== targetGroup) continue;
-
-      const eduContexts = vProps['ccm:educationalcontext'] ?? [];
-
-      results.push({
-        variantId: variant.ref?.id ?? '',
-        variantName: vProps['cm:name']?.[0] || variant.name || '',
-        variantTitle: vProps['cclom:title']?.[0] || vProps['cm:title']?.[0] || '',
-        targetGroup: vTargetGroup || 'nicht gesetzt',
-        educationalContexts: eduContexts,
-        isTemplate: false,
-        topicPageUrl,
-        collectionId,
-        collectionName,
-      });
-    }
-  }
-  return results;
+        out.push({
+          variantId: variant.ref?.id ?? '',
+          variantName: vProps['cm:name']?.[0] || variant.name || '',
+          variantTitle: vProps['cclom:title']?.[0] || vProps['cm:title']?.[0] || '',
+          targetGroup: vTargetGroup || 'nicht gesetzt',
+          educationalContexts: vProps['ccm:educationalcontext'] ?? [],
+          isTemplate: false,
+          topicPageUrl,
+          collectionId,
+          collectionName,
+        });
+      }
+      return out;
+    }),
+  );
+  return perConfig.flat();
 }
 
 // ── Theme page CONTENT (swimlane structure) ───────────────────────────────────
@@ -627,12 +686,20 @@ export async function getTopicPageContent(
   if (variantNode && !hasVariantConfig(variantNode)) {
     const ref = variantNode.properties?.['ccm:page_config_ref']?.[0];
     if (!ref) return null;
-    const configChildren = await getChildCollections(stripStoreRef(ref), 50);
+    const configChildren = await getChildCollections(stripStoreRef(ref), 50, 0, TOPIC_PAGE_PROPS);
+    // O5: alle page_config-Kinder PARALLEL laden, dann den ersten passenden
+    // Treffer in ursprünglicher Reihenfolge wählen (vorher sequenziell).
+    const contentsPerChild = await Promise.all(
+      configChildren.map(cn => {
+        const cnId = cn.ref?.id;
+        return cnId
+          ? getCollectionContents(cnId, 'both', 50, 0, TOPIC_PAGE_PROPS)
+          : Promise.resolve(null);
+      }),
+    );
     let picked: WloNode | null = null;
-    for (const cn of configChildren) {
-      const cnId = cn.ref?.id;
-      if (!cnId) continue;
-      const vr = await getCollectionContents(cnId, 'both', 50);
+    for (const vr of contentsPerChild) {
+      if (!vr) continue;
       const candidates = vr.nodes.filter(
         n => n.properties?.['ccm:page_variant_is_template']?.[0] !== 'true',
       );
